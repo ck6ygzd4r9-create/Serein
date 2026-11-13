@@ -5362,6 +5362,26 @@ impl Desktop {
 							.map_or("unrecorded", |cause| cause.source)
 							.into(),
 					),
+					(
+						"stage",
+						match &expiry {
+							Some((_, true)) => "after READY",
+							Some((_, false)) => "before READY",
+							None => "not an expiry",
+						}
+						.into(),
+					),
+					// Discord declared the token invalid (REST 401/40001 or close 4004); every
+					// other stop keeps the saved login. Removal is local and never revokes remotely.
+					(
+						"saved_login",
+						if failure == Failure::Expired {
+							"removed locally after Discord rejected the token"
+						} else {
+							"kept"
+						}
+						.into(),
+					),
 				],
 			);
 			for (setting, scope) in [

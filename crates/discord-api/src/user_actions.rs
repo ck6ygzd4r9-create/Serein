@@ -936,4 +936,61 @@ mod tests {
 		));
 		server.await.unwrap();
 	}
+	/// Regression: only Discord rejecting the token ends a session; a refused or throttled
+	/// block keeps the connection (and so the saved login), and the 401 cause names no ids.
+	#[tokio::test]
+	async fn refused_or_throttled_block_keeps_the_session_and_only_a_401_ends_it() {
+		for (status, body, expected, ends) in [
+			("403 Forbidden", "{}", Failure::Forbidden, false),
+			(
+				"429 Too Many Requests",
+				r#"{"retry_after":0.01}"#,
+				Failure::RateLimited,
+				false,
+			),
+			("401 Unauthorized", "{}", Failure::Expired, true),
+		] {
+			let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+			let slot = client_core::auth::ExpirySlot::default();
+			let mut api = DiscordApi::new(Arc::new(
+				SessionSecret::from_owner_input("SYNTHETIC_BLOCK_TOKEN".into()).unwrap(),
+			))
+			.unwrap()
+			.reporting_expiry(slot.clone());
+			api.base = format!("http://{}", listener.local_addr().unwrap());
+			let server = tokio::spawn(async move {
+				let (mut socket, _) = listener.accept().await.unwrap();
+				let mut chunk = [0; 2048];
+				let _ = socket.read(&mut chunk).await.unwrap();
+				socket
+					.write_all(
+						format!(
+							"HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+							body.len()
+						)
+						.as_bytes(),
+					)
+					.await
+					.unwrap();
+			});
+			let result = api
+				.user_action(
+					&Action::Block {
+						user: Id(123_456_789),
+						blocked: true,
+					},
+					None,
+					None,
+				)
+				.await;
+			assert_eq!(result, Err(expected));
+			assert_eq!(api.stopped(), ends, "{status}");
+			assert_eq!(slot.get().is_some(), ends, "{status}");
+			if let Some(cause) = slot.get() {
+				let text = cause.to_string();
+				assert!(text.contains("REST HTTP 401") && !text.contains("123456789"));
+			}
+			server.await.unwrap();
+		}
+	}
 }
