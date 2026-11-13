@@ -119,6 +119,9 @@ pub struct StreamPreview {
 }
 /// Automatic rejoins after joined media drops before the call fails.
 pub const MAX_REJOIN_ATTEMPTS: u8 = 3;
+/// Simultaneously watched streams per call. Each is a separate stream-server connection with
+/// its own decoder, so the bound caps sockets, decoder threads and GPU pictures together.
+pub const MAX_WATCHED: usize = 4;
 pub struct Call {
 	pub channel: Id,
 	pub guild: Option<Id>,
@@ -132,8 +135,9 @@ pub struct Call {
 	pub deafened: bool,
 	pub participants: Vec<Participant>,
 	pub camera: bool,
-	/// Participant whose screen share this device explicitly chose to watch.
-	pub watching: Option<Id>,
+	/// Participants whose screen shares this device explicitly chose to watch, in the order they
+	/// were opened and bounded by [`MAX_WATCHED`]. Each is its own stream connection.
+	pub watching: Vec<Id>,
 	pub error: Option<&'static str>,
 	/// Automatic rejoin after joined media dropped: the attempt (1-based) and why it dropped.
 	/// Cleared once the replacement session connects.
@@ -656,7 +660,7 @@ impl ClientState {
 			muted,
 			deafened,
 			camera: false,
-			watching: None,
+			watching: Vec::new(),
 			participants,
 			error: None,
 			reconnecting: None,
@@ -681,7 +685,7 @@ impl ClientState {
 		{
 			call.phase = Phase::Connecting;
 			call.camera = false;
-			call.watching = None;
+			call.watching.clear();
 			call.reconnecting = Some((attempt, reason));
 		}
 	}
@@ -792,13 +796,15 @@ impl ClientState {
 			enabled,
 		}))
 	}
-	/// Choose one streaming participant of the connected call to watch. Nothing connects
-	/// until the desktop negotiates the stream; `None` when the choice is not possible.
+	/// Add one streaming participant of the connected call to the watched set, keeping the
+	/// streams already open. Nothing connects until the desktop negotiates the stream; `None`
+	/// when the choice is not possible, including a full set.
 	pub fn watch_stream(&mut self, streamer: Id) -> Option<()> {
 		let own = self.user.as_ref().map(|user| user.id);
 		let call = self.voice.active.as_mut()?;
 		if !matches!(call.phase, Phase::Connected | Phase::Waiting)
-			|| call.watching == Some(streamer)
+			|| call.watching.contains(&streamer)
+			|| call.watching.len() >= MAX_WATCHED
 			|| own == Some(streamer)
 			|| !call
 				.participants
@@ -807,12 +813,19 @@ impl ClientState {
 		{
 			return None;
 		}
-		call.watching = Some(streamer);
+		call.watching.push(streamer);
 		Some(())
 	}
-	pub fn stop_watching(&mut self) {
+	/// Stop one watched stream; the others keep playing.
+	pub fn stop_watching(&mut self, streamer: Id) {
 		if let Some(call) = &mut self.voice.active {
-			call.watching = None;
+			call.watching.retain(|watched| *watched != streamer);
+		}
+	}
+	/// Stop every watched stream of the active call.
+	pub fn stop_watching_all(&mut self) {
+		if let Some(call) = &mut self.voice.active {
+			call.watching.clear();
 		}
 	}
 	pub fn apply_voice(&mut self, event: Event) {
@@ -989,11 +1002,9 @@ impl ClientState {
 							self.voice.outgoing = None;
 						}
 						call.participants = participants.clone();
-						if call.watching.is_some_and(|user| {
-							!participants.iter().any(|p| p.user == user && p.streaming)
-						}) {
-							call.watching = None;
-						}
+						call.watching.retain(|user| {
+							participants.iter().any(|p| p.user == *user && p.streaming)
+						});
 					}
 					self.remember_dm_participants(channel, participants);
 				}
@@ -1155,8 +1166,8 @@ impl ClientState {
 						..participant
 					});
 				}
-				if call.watching == Some(user) && (channel != Some(call.channel) || !streaming) {
-					call.watching = None;
+				if channel != Some(call.channel) || !streaming {
+					call.watching.retain(|watched| *watched != user);
 				}
 			}
 			Event::ParticipantStream {
@@ -1175,8 +1186,8 @@ impl ClientState {
 					{
 						participant.streaming = streaming;
 					}
-					if !streaming && call.watching == Some(user) {
-						call.watching = None;
+					if !streaming {
+						call.watching.retain(|watched| *watched != user);
 					}
 				}
 				// Keep the retained call membership current, so a later join shows it too.
@@ -1240,7 +1251,7 @@ impl ClientState {
 					self.voice.outgoing = None;
 					call.phase = Phase::Failed;
 					call.camera = false;
-					call.watching = None;
+					call.watching.clear();
 					call.reconnecting = None;
 					call.error.get_or_insert(message);
 					call.participants.clear();
@@ -1300,12 +1311,9 @@ impl ClientState {
 				call.server_muted = own.server_muted;
 				call.server_deafened = own.server_deafened;
 			}
-			if call
-				.watching
-				.is_some_and(|w| !call.participants.iter().any(|p| p.user == w && p.streaming))
-			{
-				call.watching = None;
-			}
+			let participants = &call.participants;
+			call.watching
+				.retain(|w| participants.iter().any(|p| p.user == *w && p.streaming));
 			if call.participants.len() > MAX_PARTICIPANTS {
 				self.disconnect_voice("Voice channel exceeds the 64 participant limit");
 			}
@@ -1371,7 +1379,7 @@ impl ClientState {
 		if let Some(call) = &mut self.voice.active {
 			call.phase = Phase::Failed;
 			call.camera = false;
-			call.watching = None;
+			call.watching.clear();
 			call.reconnecting = None;
 			call.error.get_or_insert(reason);
 			call.participants.clear();
@@ -2586,6 +2594,47 @@ mod tests {
 	}
 
 	#[test]
+	fn several_streams_are_watched_independently_and_bounded() {
+		let mut state = dm_state();
+		state.start_call(Id(2), false).unwrap();
+		let peer = |user| Participant {
+			user: Id(user),
+			muted: false,
+			deafened: false,
+			server_muted: false,
+			server_deafened: false,
+			video: false,
+			streaming: true,
+		};
+		let call = state.voice.active.as_mut().unwrap();
+		call.phase = Phase::Connected;
+		call.participants = (3..=8).map(peer).collect();
+		for user in 3..=6 {
+			assert!(state.watch_stream(Id(user)).is_some());
+		}
+		assert!(state.watch_stream(Id(3)).is_none(), "no duplicate view");
+		assert!(state.watch_stream(Id(7)).is_none(), "the set is bounded");
+		let call = state.voice.active.as_ref().unwrap();
+		assert_eq!(call.watching, [Id(3), Id(4), Id(5), Id(6)]);
+		// Closing or losing one stream leaves the others open.
+		state.stop_watching(Id(4));
+		state.apply_voice(Event::ParticipantStream {
+			channel: Id(2),
+			user: Id(5),
+			streaming: false,
+		});
+		assert_eq!(
+			state.voice.active.as_ref().unwrap().watching,
+			[Id(3), Id(6)]
+		);
+		assert!(
+			state.watch_stream(Id(7)).is_some(),
+			"a freed slot is reusable"
+		);
+		state.stop_watching_all();
+		assert!(state.voice.active.as_ref().unwrap().watching.is_empty());
+	}
+	#[test]
 	fn a_private_call_stream_survives_participant_updates_until_it_ends() {
 		let mut state = dm_state();
 		state.start_call(Id(2), false).unwrap();
@@ -2600,7 +2649,7 @@ mod tests {
 		};
 		let call = state.voice.active.as_mut().unwrap();
 		call.participants = vec![peer];
-		call.watching = Some(Id(3));
+		call.watching = vec![Id(3)];
 		state.voice.dm_participants = vec![(Id(2), vec![peer])];
 		state.apply_voice(Event::ParticipantStream {
 			channel: Id(2),
@@ -2632,7 +2681,7 @@ mod tests {
 		);
 		assert_eq!(
 			call.watching,
-			Some(Id(3)),
+			vec![Id(3)],
 			"a mute keeps the stream's watcher"
 		);
 		assert!(state.voice.dm_participants[0].1[0].streaming);
@@ -2662,7 +2711,8 @@ mod tests {
 		let call = state.voice.active.as_ref().unwrap();
 		assert!(!call.participants[0].streaming);
 		assert_eq!(
-			call.watching, None,
+			call.watching,
+			vec![],
 			"a stream that stopped cannot stay watched"
 		);
 		// Another conversation's stream leaves this call alone.

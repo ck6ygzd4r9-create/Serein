@@ -173,7 +173,7 @@ fn main() {
 		}
 		assert_eq!(
 			state.voice.active.as_ref().unwrap().watching,
-			Some(model::Id(3)),
+			vec![model::Id(3)],
 			"clicking the stream box must start watching"
 		);
 		assert_eq!(
@@ -181,9 +181,14 @@ fn main() {
 			Some(ui::StageFocus::Stream(model::Id(3))),
 			"watching must enlarge the stream at once"
 		);
-		state.voice.active.as_mut().unwrap().watching = Some(model::Id(7));
+		state.voice.active.as_mut().unwrap().watching = vec![model::Id(7)];
 		if right_click {
-			view.voice_stream_view = Some(stream_view);
+			view.voice_streams = vec![ui::StreamView {
+				user: model::Id(7),
+				texture: Some(stream_view),
+				status: "",
+				painted: 0,
+			}];
 		}
 		assert_eq!(view.voice_stream_volume(), 100);
 		for expanded in [true, false] {
@@ -313,17 +318,17 @@ fn main() {
 				for pressed in [true, false] {
 					frame(&ctx, &mut view, &mut state, width, click(stop, pressed));
 				}
-				assert_eq!(state.voice.active.as_ref().unwrap().watching, None);
+				assert!(state.voice.active.as_ref().unwrap().watching.is_empty());
 				assert_eq!(view.take_voice_fullscreen_request(), Some(false));
 				// A share that ends while fullscreen restores the window on its own.
-				state.voice.active.as_mut().unwrap().watching = Some(model::Id(7));
+				state.voice.active.as_mut().unwrap().watching = vec![model::Id(7)];
 				view.voice_focus = Some(ui::StageFocus::Stream(model::Id(7)));
 				frame(&ctx, &mut view, &mut state, width, vec![]);
 				enter(&mut view, &mut state);
-				state.voice.active.as_mut().unwrap().watching = None;
+				state.voice.active.as_mut().unwrap().watching.clear();
 				frame(&ctx, &mut view, &mut state, width, vec![]);
 				assert_eq!(view.take_voice_fullscreen_request(), Some(false));
-				state.voice.active.as_mut().unwrap().watching = Some(model::Id(7));
+				state.voice.active.as_mut().unwrap().watching = vec![model::Id(7)];
 				view.voice_focus = Some(ui::StageFocus::Stream(model::Id(7)));
 				// Signing out while fullscreen still hands the desktop a restore request.
 				enter(&mut view, &mut state);
@@ -332,7 +337,12 @@ fn main() {
 				view.language = ui::i18n::Language::English;
 				view.voice_focus = Some(ui::StageFocus::Stream(model::Id(7)));
 				if right_click {
-					view.voice_stream_view = Some(stream_view);
+					view.voice_streams = vec![ui::StreamView {
+						user: model::Id(7),
+						texture: Some(stream_view),
+						status: "",
+						painted: 0,
+					}];
 				}
 			}
 		}
@@ -396,7 +406,142 @@ fn main() {
 		});
 		assert!(!state.can_compose(channel) && !state.can_read_history(channel));
 	}
+	multistream_grid();
 	println!(
-		"PASS: voice chat history, wide/narrow screen-share fullscreen and audio controls, stream mute, independent user volume, permission gates (offline egui)."
+		"PASS: voice chat history, wide/narrow screen-share fullscreen and audio controls, four-stream grid with per-tile close, stream mute, independent user volume, permission gates (offline egui)."
 	);
+}
+
+/// Four watched shares share the stage: distinct non-overlapping tiles inside the window, a
+/// tile's own close button stops only that share, and the remaining ones keep their tiles.
+fn multistream_grid() {
+	for width in [1400.0, 800.0] {
+		let mut state = test_support::voice_demo_state();
+		let call = state.voice.active.as_mut().unwrap();
+		let template = call.participants[0];
+		let streamers = [model::Id(2), model::Id(3), model::Id(10), model::Id(11)];
+		for user in &streamers[2..] {
+			call.participants.push(client_core::voice::Participant {
+				user: *user,
+				streaming: true,
+				..template
+			});
+		}
+		call.participants
+			.iter_mut()
+			.find(|p| p.user == model::Id(2))
+			.unwrap()
+			.streaming = true;
+		for user in streamers {
+			state.watch_stream(user).unwrap();
+		}
+		let ctx = egui::Context::default();
+		let texture = ctx.load_texture(
+			"synthetic multistream",
+			egui::ColorImage::filled([320, 180], egui::Color32::GRAY),
+			egui::TextureOptions::LINEAR,
+		);
+		ui::design::apply(&ctx);
+		let mut view = ui::MessagingUi::default();
+		view.language = ui::i18n::Language::English;
+		view.voice_chat_open = false;
+		view.voice_streams = streamers
+			.iter()
+			.map(|user| ui::StreamView {
+				user: *user,
+				texture: Some(egui::load::SizedTexture::from_handle(&texture)),
+				status: "Watching the stream",
+				painted: 0,
+			})
+			.collect();
+		// Tile badges and actions fade unless the pointer is over the stage.
+		let hover = egui::pos2(width * 0.6, 400.0);
+		let mut labels = vec![];
+		for _ in 0..30 {
+			labels = frame(
+				&ctx,
+				&mut view,
+				&mut state,
+				width,
+				vec![egui::Event::PointerMoved(hover)],
+			);
+			if labels
+				.iter()
+				.filter(|(text, _)| text.ends_with("'s screen"))
+				.count() == 4
+			{
+				break;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(20));
+		}
+		let tiles: Vec<egui::Rect> = labels
+			.iter()
+			.filter(|(text, _)| text.ends_with("'s screen"))
+			.map(|(_, rect)| *rect)
+			.collect();
+		assert_eq!(
+			tiles.len(),
+			4,
+			"one named tile per watched share: {labels:?}"
+		);
+		for (index, first) in tiles.iter().enumerate() {
+			assert!(
+				first.left() >= 0.0 && first.right() <= width,
+				"tile inside the window"
+			);
+			for second in &tiles[index + 1..] {
+				assert!(!first.intersects(*second), "tiles must not overlap");
+			}
+		}
+		frame(
+			&ctx,
+			&mut view,
+			&mut state,
+			width,
+			vec![egui::Event::PointerMoved(hover)],
+		);
+		let painted = view.voice_streams.iter().all(|stream| stream.painted > 0);
+		assert!(
+			painted,
+			"every visible tile reports its paint to the desktop"
+		);
+		// Reach the first tile's close button by keyboard and press it.
+		let mut stop = None;
+		for _ in 0..60 {
+			let found = frame(
+				&ctx,
+				&mut view,
+				&mut state,
+				width,
+				vec![egui::Event::Key {
+					key: egui::Key::Tab,
+					physical_key: None,
+					pressed: true,
+					repeat: false,
+					modifiers: egui::Modifiers::NONE,
+				}],
+			);
+			stop = found
+				.iter()
+				.find(|(text, _)| text == "Stop watching")
+				.map(|(_, rect)| *rect);
+			if stop.is_some() {
+				break;
+			}
+		}
+		let stop = stop.expect("a tile close button is reachable").center();
+		for pressed in [true, false] {
+			frame(&ctx, &mut view, &mut state, width, click(stop, pressed));
+		}
+		frame(&ctx, &mut view, &mut state, width, vec![]);
+		assert_eq!(
+			state.voice.active.as_ref().unwrap().watching.len(),
+			3,
+			"closing one tile closes exactly one share"
+		);
+		assert!(
+			view.voice_focus.is_none(),
+			"closing is not a click on the tile"
+		);
+	}
 }

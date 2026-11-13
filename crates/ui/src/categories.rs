@@ -2602,7 +2602,7 @@ mod tests {
 			deafened: false,
 			participants: vec![],
 			camera: false,
-			watching: None,
+			watching: Vec::new(),
 			error: None,
 			reconnecting: None,
 		});

@@ -1356,6 +1356,7 @@ pub async fn run_stream(
 			Some(video),
 			None,
 			None,
+			Audible::default(),
 			emit,
 			url,
 			false,
@@ -1363,6 +1364,8 @@ pub async fn run_stream(
 	})
 	.await
 }
+/// Shared flag deciding whether a watched stream may feed the one playback device.
+pub type Audible = Arc<std::sync::atomic::AtomicBool>;
 /// Watch another participant's Go Live stream on its own voice gateway; decoded frames
 /// reach `sink` from a dedicated thread. Same unofficial identifiers as `run_stream`.
 pub async fn watch_stream(
@@ -1370,6 +1373,9 @@ pub async fn watch_stream(
 	identity: Arc<Identity>,
 	sink: VideoSink,
 	audio: Option<SyncSender<crate::PlaybackFrame>>,
+	// Whether this view may feed the shared playback device. Only one watched stream plays at
+	// a time, so every other view stays video-only until the flag turns on.
+	audible: Audible,
 	emit: impl Fn(Status) -> Result<(), ()> + Send + 'static,
 ) -> Result<(), &'static str> {
 	let url = endpoint(&credentials.endpoint)?;
@@ -1380,6 +1386,7 @@ pub async fn watch_stream(
 			None,
 			Some(sink),
 			audio,
+			audible,
 			emit,
 			url,
 			false,
@@ -1393,7 +1400,8 @@ async fn run_stream_inner(
 	identity: Arc<Identity>,
 	mut video: Option<crate::screen::Video>,
 	sink: Option<VideoSink>,
-	audio: Option<SyncSender<crate::PlaybackFrame>>,
+	audio_out: Option<SyncSender<crate::PlaybackFrame>>,
+	audible: Audible,
 	emit: impl Fn(Status) -> Result<(), ()>,
 	url: String,
 	local_test: bool,
@@ -1418,6 +1426,7 @@ async fn run_stream_inner(
 	let mut next_keyframe = Instant::now();
 	let mut mixer = crate::stream_audio_receive::Audio::default();
 	let mut sync = crate::stream_sync::Sync::default();
+	let mut was_audible = false;
 	let mut next_sink_wants = Instant::now();
 	let mut next_receive_report = Instant::now();
 	let mut next_transport_feedback = Instant::now();
@@ -1529,6 +1538,17 @@ async fn run_stream_inner(
 	let mut tick = tokio::time::interval(Duration::from_millis(20));
 	tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 	loop {
+		let audio_on = audible.load(Ordering::Relaxed);
+		let audio = audio_out.as_ref().filter(|_| audio_on);
+		if audio_on != was_audible {
+			// Joining or leaving the playback device restarts the view's A/V timeline.
+			was_audible = audio_on;
+			mixer.clear();
+			sync.clear();
+			if playout.clear() {
+				receivers.require_all_keyframes();
+			}
+		}
 		// A transition must discard the rest of an access unit encrypted with the old
 		// epoch before any further packet is sent, including between paced batches.
 		if !announced
@@ -1895,12 +1915,12 @@ async fn run_stream_inner(
 								}
 							},
 							11=>{let ids=data["user_ids"].as_array().ok_or("Missing stream participants")?;if ids.len()>crate::crypto::MAX_PARTICIPANTS{return Err("Too many stream participants");}let ids=ids.iter().map(|value|value.as_str().and_then(|value|value.parse().ok()).filter(|id|*id!=0).ok_or("Malformed stream participant")).collect::<Result<Vec<_>,_>>()?;let was_ready=dave.ready;if dave.connect(&ids)?{if was_ready{dave.ready=true;}else{deadline=Some(Instant::now()+Duration::from_secs(90));announced=false;awaiting_keyframe=true;invalidate_stream(&mut video, &mut share_audio);}}},
-							5=>{let user=id(data,"user_id")?;if user!=credentials.user.0 && audio.is_some() && dave.contains(user) {let value=u32::try_from(number(data,"ssrc")?).map_err(|_|"Invalid stream SSRC")?;mixer.announce(user,value)?;}},
+							5=>{let user=id(data,"user_id")?;if user!=credentials.user.0 && audio_out.is_some() && dave.contains(user) {let value=u32::try_from(number(data,"ssrc")?).map_err(|_|"Invalid stream SSRC")?;mixer.announce(user,value)?;}},
 							12=>{
 								let user=id(data,"user_id")?;
 								if user!=credentials.user.0 && dave.contains(user) {
 									if let Some(decoder) = decoder.as_ref() {announce_video(&mut receivers,decoder,user,data)?;}
-									if audio.is_some() && let Some(value)=data["audio_ssrc"].as_u64().and_then(|v|u32::try_from(v).ok()).filter(|v|*v!=0) {mixer.announce(user,value)?;}
+									if audio_out.is_some() && let Some(value)=data["audio_ssrc"].as_u64().and_then(|v|u32::try_from(v).ok()).filter(|v|*v!=0) {mixer.announce(user,value)?;}
 								}
 							},
 							13=>{let user=id(data,"user_id")?;receivers.remove(user);if let Some(decoder)=decoder.as_ref(){remove_decoder(decoder,user);}mixer.remove(user);let was_group_member=dave.is_group_member(user);let was_ready=dave.ready;if dave.disconnect(user)?{if dave.alone(){announced=false;awaiting_keyframe=true;invalidate_stream(&mut video, &mut share_audio);dave.enter_sole_member_waiting()?;deadline=None;}else if was_group_member{deadline=Some(Instant::now()+Duration::from_secs(30));announced=false;awaiting_keyframe=true;invalidate_stream(&mut video, &mut share_audio);}else if was_ready{dave.ready=true;deadline=None;}}},

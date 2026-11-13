@@ -246,6 +246,8 @@ devices are opening invalidates old readiness even when both events reach one UI
 late readiness cannot mark the call connected. Once opened, devices stay open across a brief
 rekey while callbacks are silenced and old PCM is discarded.
 
+Up to four screen shares can be watched at once, each with its own transport, decoder and
+picture; only the listened-to one feeds playback (see the November 14 compatibility note).
 A watched screen share keeps its separate transport during these call rekeys and voice
 resumption. Another participant leaving no longer sends Stop Watching just because the
 call briefly leaves the connected phase. Explicit Stop Watching, the streamer's departure,

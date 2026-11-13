@@ -146,6 +146,47 @@ five are opt-in: they stay hidden, unrequested and without catalog reads until e
 Settings › Appearance › Profile cosmetics. This is a local display choice; nothing is sent
 to Discord.
 
+## Watching several screen shares at once — November 14, 2026
+
+A call can now watch up to four other participants' screen shares together
+(`client_core::voice::MAX_WATCHED`). Each is its own stream connection, as it already was
+for one: the viewer sends `STREAM_WATCH` (opcode 20) with that share's own
+`stream_key`, receives that key's `STREAM_CREATE`/`STREAM_SERVER_UPDATE`, and opens a
+separate stream-server voice connection with its own MLS group, decoder and GPU picture.
+Opening another share does not touch the open ones; closing, losing or failing one
+(`STREAM_DELETE`, a socket error, a decode failure) stops only that connection. Leaving or
+rekeying the call ends all of them. The gateway keeps one attempt per streamer, routed by
+key, and bounds the set; a fifth request is refused locally.
+
+Protocol status: opcodes 19/20 and per-key routing are the **unofficial** behavior this
+client already used for one share. That Discord accepts several concurrent `STREAM_WATCH`
+requests from one session, and how many, is **unverified live**; the cap of four is this
+client's own resource bound, not a documented Discord limit. No live call with several real
+streamers has been run.
+
+Audio: all watched shares decode and show video, but only one feeds the playback device at
+a time (the oldest by default, or the one chosen with a tile's speaker button; a second
+button press silences all). The device pipeline has a single presentation clock that video
+follows, so mixing several shares would break A/V scheduling. A view that is not listened to
+receives and decrypts video only and ignores its audio; becoming audible later restarts its
+A/V timeline. The 0–200% volume and mute apply to the listened-to share. Per-share
+simultaneous audio is therefore **not** implemented.
+
+Resources: every share keeps its own bounded decoder queue (16 pictures/16 MiB), scheduled
+picture queue (eight pictures, 128 MiB) and one GPU texture. A share whose tile is not
+painted (another channel is open, or it is not on the stage) keeps decoding so its
+references stay valid but skips GPU uploads. Closing a share releases its connection task,
+queues and texture.
+
+Stage: watched shares lead the stage in the order they were opened, followed by unwatched
+shares as Watch Stream invitations. The existing grid, enlarge/restore and fullscreen
+behavior applies per share. Each watched tile has hover buttons to listen to it and to stop
+watching it; Escape or a click restores the grid without disconnecting anything.
+
+Extensions: `watch_stream` adds to the watched set (up to four); `stop_watching` stops all of
+them; `set_stream_audio` applies to the listened-to share; the captured `watched_stream`
+context is the oldest watched share.
+
 ## Member moderation from the user menu — November 13, 2026
 
 A server member's context menu offers Timeout, Kick and Ban, each behind a confirmation.
