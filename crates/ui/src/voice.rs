@@ -1441,33 +1441,44 @@ impl MessagingUi {
 				}
 			}
 		} else {
-			// Pick the column count that makes the tiles largest inside the stage, so two
-			// participants fill the width instead of sitting in a corner. Frameless DM avatars
-			// instead keep Discord's tight spacing and shrink to fit a short panel.
-			let (columns, size) = if frameless {
-				frameless_fit(tiles.len(), area.size())
+			// Frameless DM avatars keep Discord's tight spacing and shrink to fit a short panel.
+			// Everything else packs rows of tiles in their own video aspect, so each video is as
+			// large as the whole stage allows; only avatar-only stages keep a size cap.
+			let rects = if frameless {
+				let (columns, size) = frameless_fit(tiles.len(), area.size());
+				if size.x < 24.0 || size.y < 24.0 {
+					return;
+				}
+				let rows = tiles.len().div_ceil(columns);
+				let content = size.y * rows as f32 + TILE_GAP * (rows as f32 - 1.0);
+				let top = area.top() + ((area.height() - content) * 0.5).max(0.0);
+				(0..tiles.len())
+					.map(|index| {
+						let (row, column) = (index / columns, index % columns);
+						let in_row = (tiles.len() - row * columns).min(columns);
+						let width = size.x * in_row as f32 + TILE_GAP * (in_row as f32 - 1.0);
+						let x = area.center().x - width * 0.5 + (size.x + TILE_GAP) * column as f32;
+						egui::Rect::from_min_size(
+							egui::pos2(x, top + (size.y + TILE_GAP) * row as f32),
+							size,
+						)
+					})
+					.collect()
 			} else {
-				best_fit(tiles.len(), area.size(), 620.0)
+				let aspects: Vec<f32> = tiles
+					.iter()
+					.map(|tile| self.tile_aspect(state, channel, tile))
+					.collect();
+				let cap = (!video).then_some(AVATAR_TILE_CAP);
+				let rects = fit_grid(&aspects, area, TILE_GAP, cap);
+				if rects.iter().any(|r| r.width() < 24.0 || r.height() < 24.0) {
+					return;
+				}
+				rects
 			};
-			if size.x < 24.0 || size.y < 24.0 {
-				return;
-			}
-			let rows = tiles.len().div_ceil(columns);
-			let content = size.y * rows as f32 + TILE_GAP * (rows as f32 - 1.0);
-			let top = area.top() + ((area.height() - content) * 0.5).max(0.0);
-			for row in 0..rows {
-				let first = row * columns;
-				let in_row = (tiles.len() - first).min(columns);
-				let width = size.x * in_row as f32 + TILE_GAP * (in_row as f32 - 1.0);
-				let mut x = area.center().x - width * 0.5;
-				let y = top + (size.y + TILE_GAP) * row as f32;
-				for tile in &tiles[first..first + in_row] {
-					let rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
-					x += size.x + TILE_GAP;
-					if let Some(focus) = self.tile(ui, state, channel, tile, rect, frameless, false)
-					{
-						toggle = Some(focus);
-					}
+			for (tile, rect) in tiles.iter().zip(rects) {
+				if let Some(focus) = self.tile(ui, state, channel, tile, rect, frameless, false) {
+					toggle = Some(focus);
 				}
 			}
 		}
@@ -1489,6 +1500,46 @@ impl MessagingUi {
 			.iter()
 			.find(|(id, _)| *id == user)
 			.map(|(_, texture)| texture)
+	}
+
+	/// Width over height of what a tile shows: the decoded picture's own shape, or 16:9 while
+	/// there is none. Only reads textures that already exist, so a layout change never touches
+	/// decoders or uploads.
+	fn tile_aspect(&self, state: &State, channel: Id, tile: &Tile<'_>) -> f32 {
+		let size = match tile {
+			Tile::LocalScreen => self
+				.screen
+				.preview
+				.as_ref()
+				.filter(|_| !self.screen.preview_paused)
+				.map(|texture| texture.resolution_vec2()),
+			Tile::Stream(streamer) => self
+				.voice_streams
+				.iter()
+				.find(|view| view.user == *streamer)
+				.and_then(|view| view.texture)
+				.map(|texture| texture.size),
+			Tile::Participant(entry) => {
+				let own = state
+					.user
+					.as_ref()
+					.is_some_and(|user| user.id == entry.participant.user);
+				if !self.tile_has_video(state, channel, tile) {
+					None
+				} else if own {
+					self.voice_camera_preview
+						.as_ref()
+						.map(|texture| texture.resolution_vec2())
+				} else {
+					self.remote_texture(entry.participant.user)
+						.map(|texture| texture.size)
+				}
+			}
+		};
+		size.filter(|size| size.x > 0.0 && size.y > 0.0)
+			.map_or(16.0 / 9.0, |size| {
+				(size.x / size.y).clamp(MIN_ASPECT, MAX_ASPECT)
+			})
 	}
 
 	fn tile_has_video(&self, state: &State, channel: Id, tile: &Tile<'_>) -> bool {
@@ -2068,7 +2119,7 @@ impl MessagingUi {
 			.as_ref()
 			.filter(|call| call.channel == entry.channel && call.phase != Phase::Failed);
 		let inactive = inactive_recipient(state, entry.channel, entry.participant.user);
-		// The local preview is mirrored like a webcam; remote cameras fill the tile edge to edge.
+		// The local preview is mirrored like a webcam; cameras keep their own aspect inside the tile.
 		let video = if own && call.is_some_and(|call| call.camera) {
 			self.voice_camera_preview
 				.as_ref()
@@ -2083,7 +2134,7 @@ impl MessagingUi {
 			ui.painter().rect_filled(rect, 8, TILE_FILL);
 		}
 		if let Some((id, image, mirror)) = video {
-			cover_image(ui, rect, id, image, mirror);
+			contain_image(ui, rect, id, image, mirror);
 		}
 		let speaking = self.is_speaking(state, entry.channel, &entry.participant);
 		let avatar_size = tile_avatar(size, frameless);
@@ -4739,6 +4790,11 @@ const STAGE_TEXT: egui::Color32 = egui::Color32::from_rgb(0xdb, 0xde, 0xe1);
 const STAGE_MUTED: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x9b, 0xa1);
 const STAGE_MARGIN: f32 = 16.0;
 const TILE_GAP: f32 = 8.0;
+/// Widest an avatar-only tile grows; stages with video use the whole stage instead.
+const AVATAR_TILE_CAP: f32 = 620.0;
+/// Bounds on a tile's aspect ratio, so a degenerate frame cannot collapse the layout.
+const MIN_ASPECT: f32 = 0.4;
+const MAX_ASPECT: f32 = 3.5;
 /// Frameless DM tile height and the horizontal room beside each avatar for its name.
 const FRAMELESS_HEIGHT: f32 = 132.0;
 const FRAMELESS_MARGIN: f32 = 20.0;
@@ -4837,26 +4893,103 @@ fn frameless_fit(count: usize, area: egui::Vec2) -> (usize, egui::Vec2) {
 	}
 }
 
-/// Column count and tile size that make the tiles largest inside `area`, at 16:9.
-fn best_fit(count: usize, area: egui::Vec2, cap: f32) -> (usize, egui::Vec2) {
-	let mut best = (1, egui::Vec2::ZERO);
-	for columns in 1..=count.max(1) {
-		let rows = count.div_ceil(columns);
-		let width = (area.x - TILE_GAP * (columns - 1) as f32) / columns as f32;
-		let height = (area.y - TILE_GAP * (rows - 1) as f32) / rows as f32;
-		if width <= 0.0 || height <= 0.0 {
-			continue;
+/// Packs tiles of the given aspect ratios (width over height) into `area` as centred rows,
+/// in order, choosing the arrangement with the largest total tile area. Every tile keeps its
+/// own aspect, so nothing needs cropping or letterboxing, and rows of different shapes still
+/// share one height per row. `cap` bounds a tile's width for stages without video.
+fn fit_grid(aspects: &[f32], area: egui::Rect, gap: f32, cap: Option<f32>) -> Vec<egui::Rect> {
+	let count = aspects.len();
+	if count == 0 || area.width() <= 0.0 || area.height() <= 0.0 {
+		return vec![egui::Rect::from_min_size(area.min, egui::Vec2::ZERO); count];
+	}
+	// Row sizes to try: filled left to right with `n` columns, or as even as possible.
+	let mut candidates: Vec<Vec<usize>> = Vec::new();
+	for columns in (1..=count).rev() {
+		let mut rows = vec![columns; count / columns];
+		if !count.is_multiple_of(columns) {
+			rows.push(count % columns);
 		}
-		let width = width.min(height * 16.0 / 9.0).min(cap);
-		// Prefer side-by-side tiles when the size cap makes multiple layouts tie.
-		if width >= best.1.x {
-			best = (columns, egui::vec2(width, width * 9.0 / 16.0));
+		candidates.push(rows);
+	}
+	for rows in 2..count {
+		let (base, extra) = (count / rows, count % rows);
+		candidates.push(
+			(0..rows)
+				.map(|row| base + usize::from(row < extra))
+				.collect(),
+		);
+	}
+	let place = |rows: &[usize]| -> (f32, Vec<f32>) {
+		// Natural row height when the row spans the full width.
+		let mut first = 0;
+		let natural: Vec<f32> = rows
+			.iter()
+			.map(|&in_row| {
+				let sum: f32 = aspects[first..first + in_row].iter().sum();
+				let height = (area.width() - gap * (in_row as f32 - 1.0)) / sum;
+				first += in_row;
+				height
+			})
+			.collect();
+		let gaps = gap * (rows.len() as f32 - 1.0);
+		let mut scale = ((area.height() - gaps) / natural.iter().sum::<f32>()).clamp(0.0, 1.0);
+		if let Some(cap) = cap {
+			let widest = natural
+				.iter()
+				.zip(rows)
+				.scan(0, |first, (height, &in_row)| {
+					let widest = aspects[*first..*first + in_row]
+						.iter()
+						.fold(0.0f32, |most, aspect| most.max(aspect * height));
+					*first += in_row;
+					Some(widest)
+				})
+				.fold(0.0f32, f32::max);
+			scale = scale.min(cap / widest);
+		}
+		let mut area_sum = 0.0;
+		let mut first = 0;
+		for (height, &in_row) in natural.iter().zip(rows) {
+			let height = height * scale;
+			area_sum += aspects[first..first + in_row]
+				.iter()
+				.map(|aspect| aspect * height * height)
+				.sum::<f32>();
+			first += in_row;
+		}
+		(area_sum, natural.into_iter().map(|h| h * scale).collect())
+	};
+	let mut best: Option<(f32, &Vec<usize>, Vec<f32>)> = None;
+	for rows in &candidates {
+		let (score, heights) = place(rows);
+		// Ties keep the earlier, side-by-side arrangement.
+		if best.as_ref().is_none_or(|(top, ..)| score > top * 1.0001) {
+			best = Some((score, rows, heights));
 		}
 	}
-	if best.1.x <= 0.0 {
-		best = (count.max(1), egui::Vec2::ZERO);
+	let (_, rows, heights) = best.expect("at least one arrangement");
+	let content = heights.iter().sum::<f32>() + gap * (rows.len() as f32 - 1.0);
+	let mut y = area.top() + ((area.height() - content) * 0.5).max(0.0);
+	let mut rects = Vec::with_capacity(count);
+	let mut first = 0;
+	for (&in_row, &height) in rows.iter().zip(&heights) {
+		let widths: Vec<f32> = aspects[first..first + in_row]
+			.iter()
+			.map(|aspect| aspect * height)
+			.collect();
+		let row = widths.iter().sum::<f32>() + gap * (in_row as f32 - 1.0);
+		let mut x = area.center().x - row * 0.5;
+		for width in widths {
+			rects.push(egui::Rect::from_min_size(
+				egui::pos2(x, y),
+				egui::vec2(width, height),
+			));
+			x += width + gap;
+		}
+		y += height + gap;
+		first += in_row;
 	}
-	best
+	rects
 }
 
 /// The largest centred rectangle of the image's aspect ratio inside `rect`.
@@ -4868,8 +5001,8 @@ fn fit_rect(rect: egui::Rect, image: egui::Vec2) -> egui::Rect {
 	egui::Rect::from_center_size(rect.center(), size)
 }
 
-/// Fill the tile edge to edge, cropping the overflow (Discord's camera framing).
-fn cover_image(
+/// Draw the whole image at its own aspect inside the tile, never cropping or stretching it.
+fn contain_image(
 	ui: &mut egui::Ui,
 	rect: egui::Rect,
 	id: egui::TextureId,
@@ -4879,18 +5012,14 @@ fn cover_image(
 	if image.x <= 0.0 || image.y <= 0.0 {
 		return;
 	}
-	let scale = (rect.width() / image.x).max(rect.height() / image.y);
-	let shown = egui::vec2(
-		(rect.width() / (image.x * scale)).min(1.0),
-		(rect.height() / (image.y * scale)).min(1.0),
-	);
-	let mut uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), shown);
+	let content = fit_rect(rect, image);
+	let mut uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
 	if mirror {
 		std::mem::swap(&mut uv.min.x, &mut uv.max.x);
 	}
 	ui.put(
-		rect,
-		egui::Image::from_texture((id, rect.size()))
+		content,
+		egui::Image::from_texture((id, content.size()))
 			.uv(uv)
 			.corner_radius(8),
 	);
@@ -7217,5 +7346,65 @@ mod tests {
 		output.drop_without_applying_deltas();
 		assert_eq!(badge_width, expected_width);
 		crate::i18n::set_current(prev_lang);
+	}
+	fn grid(aspects: &[f32], w: f32, h: f32) -> Vec<egui::Rect> {
+		fit_grid(
+			aspects,
+			egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h)),
+			TILE_GAP,
+			None,
+		)
+	}
+
+	/// Regression: tiles were capped at 620 px wide and forced to 16:9, so a lone share or the
+	/// two left after hiding others stayed small.
+	#[test]
+	fn video_grid_grows_when_tiles_leave_and_keeps_aspects() {
+		let wide = 16.0 / 9.0;
+		let four = grid(&[wide; 4], 1200.0, 900.0);
+		let two = grid(&[wide; 2], 1200.0, 900.0);
+		let one = grid(&[wide], 1600.0, 900.0);
+		assert!(
+			two[0].width() > four[0].width() * 1.4,
+			"{two:?} vs {four:?}"
+		);
+		assert!(
+			one[0].width() > 1590.0 && one[0].height() > 890.0,
+			"{one:?}"
+		);
+		for (aspects, w, h) in [
+			(vec![wide, 4.0 / 3.0, 9.0 / 16.0], 1280.0, 720.0),
+			(vec![9.0 / 16.0; 3], 1000.0, 1000.0),
+			(vec![wide; 7], 700.0, 1200.0),
+		] {
+			let rects = grid(&aspects, w, h);
+			for (rect, aspect) in rects.iter().zip(&aspects) {
+				assert!((rect.width() / rect.height() - aspect).abs() < 0.01);
+				assert!(rect.min.x >= -0.01 && rect.max.x <= w + 0.01);
+				assert!(rect.min.y >= -0.01 && rect.max.y <= h + 0.01);
+			}
+			for (i, a) in rects.iter().enumerate() {
+				for b in &rects[i + 1..] {
+					assert!(!a.shrink(0.1).intersects(*b), "{a:?} overlaps {b:?}");
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn video_grid_picks_the_stacking_that_fits_the_window() {
+		let wide = 16.0 / 9.0;
+		// Two 16:9 videos: side by side in a wide window, stacked in a tall one.
+		let side = grid(&[wide; 2], 1600.0, 600.0);
+		assert!(side[0].max.x < side[1].min.x);
+		let stacked = grid(&[wide; 2], 600.0, 1400.0);
+		assert!(stacked[0].max.y < stacked[1].min.y);
+	}
+
+	#[test]
+	fn avatar_only_tiles_keep_their_width_cap() {
+		let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+		let rects = fit_grid(&[16.0 / 9.0], area, TILE_GAP, Some(AVATAR_TILE_CAP));
+		assert!((rects[0].width() - AVATAR_TILE_CAP).abs() < 0.5);
 	}
 }
