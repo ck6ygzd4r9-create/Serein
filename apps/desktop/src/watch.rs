@@ -5,7 +5,7 @@ use discord_voice::{Identity, Status};
 use eframe::egui;
 use model::Id;
 use std::{
-	sync::{Arc, Mutex},
+	sync::{Arc, Mutex, atomic::Ordering},
 	time::{Duration, Instant},
 };
 use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
@@ -136,19 +136,39 @@ struct Live {
 	frames: Arc<Mutex<Scheduled>>,
 }
 
-#[derive(Default)]
-pub(super) struct Watch {
+/// One watched stream: its negotiation, connection, decoder queue and GPU picture. Views are
+/// independent, so ending, failing or closing one never touches another.
+struct View {
+	streamer: Id,
 	pending: Option<Pending>,
 	live: Option<Live>,
 	/// The streamer stopped or Discord failed the view; the state choice is cleared next poll.
 	ended: Option<(ui::design::Level, &'static str)>,
-	sequence: u64,
 	status: &'static str,
-	/// GPU texture behind `ui.voice_stream_view`.
+	/// GPU texture behind this stream's tile.
 	texture: crate::gpu_video::VideoTexture,
+	/// Only the listened-to view feeds the one playback device; the rest stay video-only.
+	audible: discord_voice::Audible,
 }
-impl Watch {
-	pub fn stop(&mut self) {
+/// What one view asks of the manager after a poll.
+struct Polled {
+	command: Option<Command>,
+	/// False once the view is finished or no longer chosen, so the manager drops it.
+	keep: bool,
+}
+impl View {
+	fn new(streamer: Id) -> Self {
+		Self {
+			streamer,
+			pending: None,
+			live: None,
+			ended: None,
+			status: "",
+			texture: Default::default(),
+			audible: Default::default(),
+		}
+	}
+	fn stop(&mut self) {
 		self.pending = None;
 		self.ended = None;
 		if let Some(live) = self.live.take() {
@@ -164,7 +184,7 @@ impl Watch {
 			.or_else(|| self.live.as_ref().map(|live| live.context))
 	}
 	/// Take negotiation secrets before the UI reduces the event. Nothing is persisted.
-	pub fn observe(&mut self, state: &State, event: &mut Event) {
+	fn observe(&mut self, state: &State, event: &mut Event) {
 		let Event::Voice(voice::Event::Watch {
 			channel,
 			request,
@@ -224,7 +244,9 @@ impl Watch {
 			screen::Event::Viewers(_) => {}
 		}
 	}
-	pub fn poll(
+	/// `wanted` is the call this view should belong to while its streamer stays chosen.
+	#[allow(clippy::too_many_arguments)] // The per-view inputs the manager derives once per poll.
+	fn poll(
 		&mut self,
 		runtime: &Runtime,
 		state: &mut State,
@@ -232,37 +254,35 @@ impl Watch {
 		ctx: &egui::Context,
 		call: Option<super::screen::Call<'_>>,
 		audio: Option<std::sync::mpsc::SyncSender<discord_voice::PlaybackFrame>>,
-	) -> Option<Command> {
-		let wanted = state.voice.active.as_ref().and_then(|active| {
-			let streamer = active.watching?;
-			// The separate stream transport survives call rekeys and voice resumption.
-			(active.phase != voice::Phase::Failed).then_some((
-				state.generation,
-				active.channel,
-				active.request,
-				streamer,
-			))
-		});
-		let current = self.context();
+		wanted: Option<(u64, Id, u64)>,
+		audible: bool,
+		visible: bool,
+		sequence: &mut u64,
+	) -> Polled {
+		self.audible.store(audible, Ordering::Relaxed);
+		let wanted = wanted
+			.map(|(generation, channel, request)| (generation, channel, request, self.streamer));
 		let mut command = None;
-		if let Some(context) = current
-			&& (state.demo
-				|| wanted
-					!= Some((
-						context.generation,
-						context.channel,
-						context.request,
-						context.streamer,
-					))) {
+		if let Some(context) = self.context()
+			&& wanted
+				!= Some((
+					context.generation,
+					context.channel,
+					context.request,
+					context.streamer,
+				)) {
 			self.stop();
-			self.status = "Stopped watching";
-			if context.generation == state.generation && !state.demo {
+			if context.generation == state.generation {
 				command = Some(Command::Voice(voice::Command::StopWatching {
 					channel: context.channel,
 					request: context.request,
 					stream_request: context.stream_request,
 				}));
 			}
+			return Polled {
+				command,
+				keep: false,
+			};
 		}
 		if let Some((level, message)) = self.ended.take() {
 			let context = self.context();
@@ -270,43 +290,43 @@ impl Watch {
 			self.status = message;
 			// Said once; the stage keeps no line for a view that already ended.
 			ui.toasts.push(level, message);
-			state.stop_watching();
-			ui.voice_stream_view = None;
-			self.texture = Default::default();
-			ui.voice_stream_status = self.status;
-			return command.or_else(|| {
-				let context = context.filter(|context| context.generation == state.generation)?;
-				Some(Command::Voice(voice::Command::StopWatching {
-					channel: context.channel,
-					request: context.request,
-					stream_request: context.stream_request,
-				}))
-			});
-		}
-		if state.demo {
-			ui.voice_stream_status = if wanted.is_some() {
-				"Offline preview · no stream is received"
-			} else {
-				""
+			state.stop_watching(self.streamer);
+			let command = context
+				.filter(|context| context.generation == state.generation)
+				.map(|context| {
+					Command::Voice(voice::Command::StopWatching {
+						channel: context.channel,
+						request: context.request,
+						stream_request: context.stream_request,
+					})
+				});
+			return Polled {
+				command,
+				keep: false,
 			};
-			return command;
 		}
-		if let Some((generation, channel, request, streamer)) = wanted
-			&& self.context().is_none()
-			&& command.is_none()
-		{
+		let Some((generation, channel, request, streamer)) = wanted else {
+			return Polled {
+				command: None,
+				keep: false,
+			};
+		};
+		if self.context().is_none() {
 			let Some(call) = call.filter(|call| {
 				call.generation == generation && call.channel == channel && call.request == request
 			}) else {
-				ui.voice_stream_status = "Connect the call before watching a stream";
-				return None;
+				self.status = "Connect the call before watching a stream";
+				return Polled {
+					command: None,
+					keep: true,
+				};
 			};
-			self.sequence = self.sequence.wrapping_add(1);
+			*sequence = sequence.wrapping_add(1);
 			let context = Context {
 				generation,
 				channel,
 				request,
-				stream_request: self.sequence,
+				stream_request: *sequence,
 				streamer,
 			};
 			self.pending = Some(Pending {
@@ -321,12 +341,15 @@ impl Watch {
 				started: Instant::now(),
 			});
 			self.status = "Requesting the stream…";
-			command = Some(Command::Voice(voice::Command::WatchStream {
-				channel,
-				request,
-				stream_request: context.stream_request,
-				streamer,
-			}));
+			return Polled {
+				command: Some(Command::Voice(voice::Command::WatchStream {
+					channel,
+					request,
+					stream_request: context.stream_request,
+					streamer,
+				})),
+				keep: true,
+			};
 		}
 		if let Some(pending) = &self.pending {
 			if pending.started.elapsed() >= SIGNAL_TIMEOUT {
@@ -361,26 +384,30 @@ impl Watch {
 				self.ended = Some((ui::design::Level::Warning, "The stream connection ended"));
 			}
 			// Uploading copies the planes into GPU staging, so it runs under the slot lock
-			// and the decoder keeps refilling the same allocation.
+			// and the decoder keeps refilling the same allocation. A stream whose tile is not
+			// on screen keeps decoding but skips the upload; the picture stays flagged fresh.
 			if let Ok(mut slot) = live.frames.try_lock() {
 				if let Some(deadline) = slot.advance(Instant::now()) {
 					ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
 				}
-				if let Some((picture, fresh)) = slot.latest.as_mut()
+				if visible
+					&& let Some((picture, fresh)) = slot.latest.as_mut()
 					&& std::mem::take(fresh)
-					&& let Some(texture) =
-						self.texture.upload(ctx, "remote-stream", picture.borrow())
+					&& self
+						.texture
+						.upload(ctx, "remote-stream", picture.borrow())
+						.is_some()
 				{
-					ui.voice_stream_view = Some(texture);
 					self.status = "Watching the stream";
 				}
 			}
 		} else {
-			ui.voice_stream_view = None;
 			self.texture = Default::default();
 		}
-		ui.voice_stream_status = if wanted.is_some() { self.status } else { "" };
-		command
+		Polled {
+			command: None,
+			keep: true,
+		}
 	}
 	fn start(
 		&mut self,
@@ -418,10 +445,16 @@ impl Watch {
 		let wake = ctx.clone();
 		let identity = pending.identity;
 		let audio = pending.audio;
+		let audible = self.audible.clone();
 		let task = runtime.spawn(async move {
 			let (status_send, status_wake) = (send.clone(), wake.clone());
-			let result =
-				discord_voice::watch_stream(credentials, identity, sink, audio, move |event| {
+			let result = discord_voice::watch_stream(
+				credentials,
+				identity,
+				sink,
+				audio,
+				audible,
+				move |event| {
 					let status = match event {
 						Status::Connecting => "Connecting to the stream…",
 						Status::Discovering => "Checking the stream network…",
@@ -438,8 +471,9 @@ impl Watch {
 					status_send.send_replace(Some(Notice::Status(status)));
 					status_wake.request_repaint();
 					Ok(())
-				})
-				.await;
+				},
+			)
+			.await;
 			if let Err(error) = result {
 				send.send_replace(Some(Notice::Failed(error)));
 			}
@@ -455,15 +489,154 @@ impl Watch {
 		Ok(())
 	}
 }
-impl Drop for Watch {
+impl Drop for View {
 	fn drop(&mut self) {
 		self.stop();
+	}
+}
+
+/// Desktop ownership for watching other participants' screen shares: one independent
+/// [`View`] per chosen stream, up to `voice::MAX_WATCHED`.
+#[derive(Default)]
+pub(super) struct Watch {
+	views: Vec<View>,
+	/// Unique per view, so Discord's replies and our stops always name one connection.
+	sequence: u64,
+}
+impl Watch {
+	pub fn stop(&mut self) {
+		for view in &mut self.views {
+			view.stop();
+		}
+		self.views.clear();
+	}
+	/// Take negotiation secrets before the UI reduces the event. Nothing is persisted.
+	pub fn observe(&mut self, state: &State, event: &mut Event) {
+		for view in &mut self.views {
+			view.observe(state, event);
+		}
+	}
+	/// Poll every view and publish their pictures to the stage. At most one command goes out
+	/// per call; the remaining work finishes on the next frame.
+	pub fn poll(
+		&mut self,
+		runtime: &Runtime,
+		state: &mut State,
+		ui: &mut ui::MessagingUi,
+		ctx: &egui::Context,
+		call: Option<super::screen::Call<'_>>,
+		audio: Option<std::sync::mpsc::SyncSender<discord_voice::PlaybackFrame>>,
+	) -> Option<Command> {
+		if state.demo {
+			// Offline previews are synthetic: the demo setup owns `ui.voice_streams`.
+			self.stop();
+			return None;
+		}
+		let active = state
+			.voice
+			.active
+			.as_ref()
+			.filter(|active| active.phase != voice::Phase::Failed);
+		// The separate stream transports survive call rekeys and voice resumption.
+		let key = active.map(|active| (state.generation, active.channel, active.request));
+		let watching = active.map_or_else(Vec::new, |active| active.watching.clone());
+		for &streamer in &watching {
+			if self.views.len() < voice::MAX_WATCHED
+				&& !self.views.iter().any(|view| view.streamer == streamer)
+			{
+				self.views.push(View::new(streamer));
+			}
+		}
+		let listening = ui.voice_audible_stream(state);
+		let frame = ctx.cumulative_frame_nr();
+		let mut command = None;
+		let mut index = 0;
+		while index < self.views.len() && command.is_none() {
+			let streamer = self.views[index].streamer;
+			let visible = ui
+				.voice_streams
+				.iter()
+				.find(|shown| shown.user == streamer)
+				.is_none_or(|shown| frame.saturating_sub(shown.painted) <= 3);
+			let polled = self.views[index].poll(
+				runtime,
+				state,
+				ui,
+				ctx,
+				call.clone(),
+				audio.clone(),
+				key.filter(|_| watching.contains(&streamer)),
+				listening == Some(streamer),
+				visible,
+				&mut self.sequence,
+			);
+			command = polled.command;
+			if polled.keep {
+				index += 1;
+			} else {
+				self.views.remove(index);
+			}
+		}
+		if command.is_some() || index < self.views.len() {
+			// Views after the one that issued a command are polled next frame.
+			ctx.request_repaint();
+		}
+		let previous = std::mem::take(&mut ui.voice_streams);
+		ui.voice_streams = self
+			.views
+			.iter()
+			.map(|view| ui::StreamView {
+				user: view.streamer,
+				texture: view.texture.texture(),
+				status: view.status,
+				painted: previous
+					.iter()
+					.find(|shown| shown.user == view.streamer)
+					.map_or(frame, |shown| shown.painted),
+			})
+			.collect();
+		command
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn view_with_live(
+		runtime: &Runtime,
+		state: &State,
+		streamer: Id,
+		stream_request: u64,
+	) -> (View, Context) {
+		let call = state.voice.active.as_ref().unwrap();
+		let context = Context {
+			generation: state.generation,
+			channel: call.channel,
+			request: call.request,
+			stream_request,
+			streamer,
+		};
+		let (_send, events) = watch::channel(None);
+		let mut view = View::new(streamer);
+		view.live = Some(Live {
+			context,
+			task: runtime.spawn(std::future::pending()),
+			events,
+			frames: Arc::new(Mutex::new(Scheduled::default())),
+		});
+		(view, context)
+	}
+
+	fn poll(
+		watch: &mut Watch,
+		runtime: &Runtime,
+		state: &mut State,
+		ui: &mut ui::MessagingUi,
+		ctx: &egui::Context,
+	) -> Option<Command> {
+		watch.poll(runtime, state, ui, ctx, None, None)
+	}
 
 	#[test]
 	fn watch_survives_call_recovery_until_its_selection_ends() {
@@ -474,31 +647,14 @@ mod tests {
 		let mut state = test_support::voice_demo_state();
 		state.demo = false;
 		state.watch_stream(Id(3)).unwrap();
-		let call = state.voice.active.as_ref().unwrap();
-		let context = Context {
-			generation: state.generation,
-			channel: call.channel,
-			request: call.request,
-			stream_request: 2,
-			streamer: Id(3),
-		};
 		let mut ui = ui::MessagingUi::default();
 		let ctx = egui::Context::default();
 		for failed in [false, true] {
-			state.voice.active.as_mut().unwrap().watching = Some(context.streamer);
-			let (_send, events) = watch::channel(None);
+			state.voice.active.as_mut().unwrap().watching = vec![Id(3)];
+			let (view, context) = view_with_live(&runtime, &state, Id(3), 2);
 			let mut watch = Watch {
-				pending: None,
-				live: Some(Live {
-					context,
-					task: runtime.spawn(std::future::pending()),
-					events,
-					frames: Arc::new(Mutex::new(Scheduled::default())),
-				}),
-				ended: None,
+				views: vec![view],
 				sequence: 0,
-				status: "",
-				texture: Default::default(),
 			};
 			for phase in [
 				voice::Phase::Connected,
@@ -509,26 +665,118 @@ mod tests {
 				voice::Phase::Connected,
 			] {
 				state.voice.active.as_mut().unwrap().phase = phase;
-				assert!(
-					watch
-						.poll(&runtime, &mut state, &mut ui, &ctx, None, None)
-						.is_none()
-				);
-				assert!(watch.live.is_some());
+				assert!(poll(&mut watch, &runtime, &mut state, &mut ui, &ctx).is_none());
+				assert!(watch.views[0].live.is_some());
 			}
 			if failed {
 				state.voice.active.as_mut().unwrap().phase = voice::Phase::Failed;
 			} else {
-				state.stop_watching();
+				state.stop_watching(Id(3));
 			}
 			assert!(matches!(
-				watch.poll(&runtime, &mut state, &mut ui, &ctx, None, None),
+				poll(&mut watch, &runtime, &mut state, &mut ui, &ctx),
 				Some(Command::Voice(voice::Command::StopWatching {
 					channel, request, stream_request: 2,
 				})) if channel == context.channel && request == context.request
 			));
-			assert!(watch.live.is_none());
+			assert!(watch.views.is_empty());
+			assert!(ui.voice_streams.is_empty());
 		}
+	}
+
+	#[test]
+	fn closing_or_losing_one_stream_leaves_the_other_views_connected() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		let mut state = test_support::voice_demo_state();
+		state.demo = false;
+		state.voice.active.as_mut().unwrap().watching = vec![Id(3), Id(4), Id(5)];
+		let mut watch = Watch::default();
+		for (streamer, request) in [(3, 7), (4, 8), (5, 9)] {
+			watch
+				.views
+				.push(view_with_live(&runtime, &state, Id(streamer), request).0);
+		}
+		let mut ui = ui::MessagingUi::default();
+		let ctx = egui::Context::default();
+		assert!(poll(&mut watch, &runtime, &mut state, &mut ui, &ctx).is_none());
+		assert_eq!(
+			ui.voice_streams
+				.iter()
+				.map(|view| view.user)
+				.collect::<Vec<_>>(),
+			[Id(3), Id(4), Id(5)]
+		);
+		// Closing the middle stream stops only that connection, by its own request number.
+		state.stop_watching(Id(4));
+		assert!(matches!(
+			poll(&mut watch, &runtime, &mut state, &mut ui, &ctx),
+			Some(Command::Voice(voice::Command::StopWatching {
+				stream_request: 8,
+				..
+			}))
+		));
+		assert_eq!(
+			watch
+				.views
+				.iter()
+				.map(|view| view.streamer)
+				.collect::<Vec<_>>(),
+			[Id(3), Id(5)]
+		);
+		assert!(watch.views.iter().all(|view| view.live.is_some()));
+		// A stream that fails ends only itself; its neighbours keep their connections.
+		watch.views[0].ended = Some((ui::design::Level::Warning, "The stream ended"));
+		assert!(matches!(
+			poll(&mut watch, &runtime, &mut state, &mut ui, &ctx),
+			Some(Command::Voice(voice::Command::StopWatching {
+				stream_request: 7,
+				..
+			}))
+		));
+		assert_eq!(state.voice.active.as_ref().unwrap().watching, [Id(5)]);
+		assert_eq!(watch.views.len(), 1);
+		assert!(watch.views[0].live.is_some());
+	}
+
+	#[test]
+	fn only_the_listened_to_stream_may_feed_playback() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		let mut state = test_support::voice_demo_state();
+		state.demo = false;
+		state.voice.active.as_mut().unwrap().watching = vec![Id(3), Id(4)];
+		let mut watch = Watch::default();
+		for (streamer, request) in [(3, 7), (4, 8)] {
+			watch
+				.views
+				.push(view_with_live(&runtime, &state, Id(streamer), request).0);
+		}
+		let mut ui = ui::MessagingUi::default();
+		let ctx = egui::Context::default();
+		let flags = |watch: &Watch| {
+			watch
+				.views
+				.iter()
+				.map(|view| view.audible.load(Ordering::Relaxed))
+				.collect::<Vec<_>>()
+		};
+		poll(&mut watch, &runtime, &mut state, &mut ui, &ctx);
+		assert_eq!(
+			flags(&watch),
+			[true, false],
+			"the oldest stream plays by default"
+		);
+		ui.voice_stream_listen = ui::StreamListen::Stream(Id(4));
+		poll(&mut watch, &runtime, &mut state, &mut ui, &ctx);
+		assert_eq!(flags(&watch), [false, true]);
+		ui.voice_stream_listen = ui::StreamListen::Silent;
+		poll(&mut watch, &runtime, &mut state, &mut ui, &ctx);
+		assert_eq!(flags(&watch), [false, false]);
 	}
 
 	fn frame(width: u32, height: u32, data: &[u8]) -> discord_voice::RemoteFrame<'_> {

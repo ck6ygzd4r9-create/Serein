@@ -97,19 +97,27 @@ fn credentials(user: u64) -> VoiceConnection {
 
 #[tokio::test]
 async fn local_stream_sender_and_viewer_deliver_audio_and_video() {
-	timeout(Duration::from_secs(15), exchange(false))
+	timeout(Duration::from_secs(15), exchange(false, false))
+		.await
+		.expect("Synthetic Go Live exchange timed out");
+}
+
+#[tokio::test]
+async fn a_view_joins_playback_only_when_it_becomes_audible() {
+	timeout(Duration::from_secs(15), exchange(false, true))
 		.await
 		.expect("Synthetic Go Live exchange timed out");
 }
 
 #[tokio::test]
 async fn established_streams_bound_missing_rekey_execution_and_welcome() {
-	timeout(Duration::from_secs(45), exchange(true))
+	timeout(Duration::from_secs(45), exchange(true, false))
 		.await
 		.expect("Stream rekey must time out while signaling remains healthy");
 }
 
-async fn exchange(rekey_timeout: bool) {
+/// `late_audio` starts the viewer video-only and lets it feed playback after its first picture.
+async fn exchange(rekey_timeout: bool, late_audio: bool) {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let url = format!("ws://{}", listener.local_addr().unwrap());
 	let (frames_tx, frames) = tokio::sync::mpsc::channel(3);
@@ -141,6 +149,7 @@ async fn exchange(rekey_timeout: bool) {
 			Some(video),
 			None,
 			None,
+			Audible::default(),
 			|_| Ok(()),
 			sender_url,
 			true,
@@ -161,6 +170,8 @@ async fn exchange(rekey_timeout: bool) {
 			picture.data.len(),
 		));
 	});
+	let audible = Audible::new((!late_audio).into());
+	let viewer_audible = audible.clone();
 	let mut viewer = tokio::spawn(async move {
 		run_stream_inner(
 			credentials(2),
@@ -168,6 +179,7 @@ async fn exchange(rekey_timeout: bool) {
 			None,
 			Some(sink),
 			Some(playback_tx),
+			viewer_audible,
 			|_| Ok(()),
 			url,
 			true,
@@ -362,6 +374,10 @@ async fn exchange(rekey_timeout: bool) {
 				timestamp += 1800;
 				while let Ok(frame) = playback_rx.try_recv() { heard |= frame.samples.iter().any(|sample| sample.abs() > 0.01); }
 				if let Ok(frame) = picture_rx.try_recv() { picture = Some(frame); }
+				if late_audio && !audible.load(Ordering::Acquire) {
+					assert!(!heard, "a video-only view must not feed playback");
+					if picture.is_some() { audible.store(true, Ordering::Release); }
+				}
 				if heard && picture.is_some() && audio_packets >= 3 { break; }
 			}
 			result = send_udp.recv_from(&mut packet) => {

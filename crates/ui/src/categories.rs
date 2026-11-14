@@ -1720,8 +1720,8 @@ mod tests {
 			.drop_without_applying_deltas();
 		};
 		frame(&mut view, &mut state);
-		let key = view.channel_cache.key;
-		let rows = view.channel_cache.rows.as_ptr();
+		let mut key = view.channel_cache.key;
+		let mut rows = view.channel_cache.rows.as_ptr();
 		assert!(!view.channel_cache.rows.is_empty());
 		for id in 1_000_000..1_000_010 {
 			state.apply(client_core::Envelope {
@@ -1729,6 +1729,14 @@ mod tests {
 				event: client_core::Event::Message(test_support::message(id, selected)),
 			});
 			frame(&mut view, &mut state);
+			// The key carries the wall-clock minute, so the rows legitimately rebuild once
+			// when a minute boundary passes mid-test; only the message may not invalidate.
+			let minute = |key: Option<CacheKey>| key.map(|key| key.minute);
+			if minute(view.channel_cache.key) != minute(key) {
+				key = view.channel_cache.key;
+				rows = view.channel_cache.rows.as_ptr();
+				continue;
+			}
 			assert!(view.channel_cache.key == key);
 			assert_eq!(view.channel_cache.rows.as_ptr(), rows);
 		}
@@ -2602,7 +2610,7 @@ mod tests {
 			deafened: false,
 			participants: vec![],
 			camera: false,
-			watching: None,
+			watching: Vec::new(),
 			error: None,
 			reconnecting: None,
 		});

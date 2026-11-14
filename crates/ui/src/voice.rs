@@ -58,7 +58,7 @@ impl MessagingUi {
 								&& self.screen.busy && (self.screen.preview.is_some()
 								|| self.screen.preview_paused)
 						}
-						StageFocus::Stream(user) => call.watching == Some(*user),
+						StageFocus::Stream(user) => call.watching.contains(user),
 						StageFocus::Participant(_) => false,
 					}
 			})
@@ -131,6 +131,17 @@ impl MessagingUi {
 			0
 		} else {
 			self.voice_stream_volume.unwrap_or(100).min(200)
+		}
+	}
+
+	/// The one watched stream that feeds the playback device: the chosen one while it is still
+	/// watched, otherwise the oldest. Every other view stays video-only.
+	pub fn voice_audible_stream(&self, state: &State) -> Option<Id> {
+		let call = state.voice.active.as_ref()?;
+		match self.voice_stream_listen {
+			StreamListen::Silent => None,
+			StreamListen::Stream(user) if call.watching.contains(&user) => Some(user),
+			_ => call.watching.first().copied(),
 		}
 	}
 
@@ -817,7 +828,7 @@ impl MessagingUi {
 							});
 							let watching = state.voice.active.as_ref().is_some_and(|call| {
 								call.channel == entry.channel
-									&& call.watching == Some(entry.participant.user)
+									&& call.watching.contains(&entry.participant.user)
 							});
 							let connected = state.voice.active.as_ref().is_some_and(|call| {
 								call.channel == entry.channel
@@ -1038,7 +1049,11 @@ impl MessagingUi {
 			}
 			Some((_, Phase::Connected | Phase::Waiting)) => {
 				self.stream_preview_watch = None;
-				if state.voice.active.as_ref().and_then(|call| call.watching) == Some(user)
+				if state
+					.voice
+					.active
+					.as_ref()
+					.is_some_and(|call| call.watching.contains(&user))
 					|| state.watch_stream(user).is_some()
 				{
 					self.voice_focus = Some(StageFocus::Stream(user));
@@ -1144,6 +1159,15 @@ impl MessagingUi {
 			self.voice_chrome_hidden = 0.0;
 		}
 
+		if connected {
+			// Over an enlarged video the switch follows the hover chrome like the call bar.
+			let hidden = if self.voice_focus.is_some() {
+				1.0 - reveal
+			} else {
+				0.0
+			};
+			self.video_only_toggle(ui, rect, rect.top() + STAGE_MARGIN, hidden);
+		}
 		self.apply_watch_request(state);
 		let bar = egui::Rect::from_min_max(
 			egui::pos2(rect.left(), rect.bottom() - bottom),
@@ -1188,16 +1212,14 @@ impl MessagingUi {
 		}
 		// Like Discord, every remote share gets its own box beside its streamer's tile; the
 		// watched one leads, the rest stay previews until someone clicks to watch.
-		let watching = call.and_then(|call| call.watching);
-		if let Some(streamer) = watching {
-			tiles.push(Tile::Stream(streamer));
-		}
+		let watching: &[Id] = call.map_or(&[], |call| call.watching.as_slice());
+		tiles.extend(watching.iter().copied().map(Tile::Stream));
 		let own = state.user.as_ref().map(|user| user.id);
 		tiles.extend(
 			entries
 				.iter()
 				.map(|entry| entry.participant.user)
-				.filter(|user| Some(*user) != watching && Some(*user) != own)
+				.filter(|user| !watching.contains(user) && Some(*user) != own)
 				.filter(|user| {
 					entries
 						.iter()
@@ -1206,7 +1228,105 @@ impl MessagingUi {
 				.map(Tile::Stream),
 		);
 		tiles.extend(entries.iter().map(Tile::Participant));
+		// A display filter only: everyone stays connected, audible and in `entries`; watched
+		// streams, decoders and focus are untouched. Live shares nobody watches keep their
+		// invite box so one can still be chosen.
+		if self.video_only_active(state, channel) {
+			let own = state.user.as_ref().map(|user| user.id);
+			let camera = call.is_some_and(|call| call.camera);
+			tiles.retain(|tile| match tile {
+				Tile::Participant(entry) => {
+					if Some(entry.participant.user) == own {
+						camera
+					} else {
+						entry.participant.video
+					}
+				}
+				Tile::LocalScreen | Tile::Stream(_) => true,
+			});
+		}
 		tiles
+	}
+
+	/// Whether the "show only video" filter applies to this channel's stage: only inside the
+	/// joined call, so browsing a channel's roster never hides who is there.
+	fn video_only_active(&self, state: &State, channel: Id) -> bool {
+		self.voice_video_only
+			&& state
+				.voice
+				.active
+				.as_ref()
+				.is_some_and(|call| call.channel == channel && call.phase != Phase::Failed)
+	}
+
+	/// The stage's top-right switch for the video-only filter; one click, no popup.
+	fn video_only_toggle(&mut self, ui: &mut egui::Ui, stage: egui::Rect, top: f32, hidden: f32) {
+		let colors = design::palette(ui);
+		let on = self.voice_video_only;
+		let size = egui::vec2(if on { 148.0 } else { 132.0 }, 32.0);
+		if stage.width() < size.x + 2.0 * STAGE_MARGIN {
+			return;
+		}
+		let rect =
+			egui::Rect::from_min_size(egui::pos2(stage.right() - STAGE_MARGIN - size.x, top), size);
+		let visible = 1.0 - hidden;
+		if visible <= 0.0 {
+			return;
+		}
+		let response = ui.interact(
+			rect,
+			ui.scope_id().with("voice-video-only"),
+			if visible > 0.5 {
+				egui::Sense::click()
+			} else {
+				egui::Sense::hover()
+			},
+		);
+		let fill = match (on, response.hovered() || response.has_focus()) {
+			(true, true) => colors.accent.gamma_multiply(1.15),
+			(true, false) => colors.accent,
+			(false, true) => egui::Color32::from_white_alpha(40),
+			(false, false) => egui::Color32::from_white_alpha(22),
+		};
+		let painter = ui.painter();
+		painter.rect_filled(rect, 16, fill.gamma_multiply(visible));
+		let ink = if on { egui::Color32::WHITE } else { STAGE_TEXT }.gamma_multiply(visible);
+		crate::icons::paint(
+			painter,
+			if on {
+				crate::icons::Icon::Video
+			} else {
+				crate::icons::Icon::VideoSlash
+			},
+			egui::Rect::from_center_size(
+				egui::pos2(rect.left() + 18.0, rect.center().y),
+				egui::Vec2::splat(16.0),
+			),
+			ink,
+		);
+		painter.text(
+			egui::pos2(rect.left() + 34.0, rect.center().y),
+			egui::Align2::LEFT_CENTER,
+			if on { "Video only: on" } else { "Video only" },
+			egui::FontId::proportional(13.0),
+			ink,
+		);
+		let label = if on {
+			"Show everyone in the call"
+		} else {
+			"Show only video"
+		};
+		response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, on, label));
+		if response
+			.on_hover_text(if on {
+				"Show participants without video again"
+			} else {
+				"Hide participants who are not sharing a camera or screen. Audio is unchanged"
+			})
+			.clicked()
+		{
+			self.voice_video_only = !on;
+		}
 	}
 
 	/// True once any stage tile carries video or a live share, so the direct-message stage
@@ -1234,6 +1354,24 @@ impl MessagingUi {
 	) {
 		let tiles = self.stage_tiles(state, channel, entries);
 		if tiles.is_empty() {
+			if self.video_only_active(state, channel) {
+				let area = ui.available_rect_before_wrap();
+				let painter = ui.painter();
+				painter.text(
+					area.center() - egui::vec2(0.0, 12.0),
+					egui::Align2::CENTER_CENTER,
+					"No one is sharing video",
+					egui::FontId::proportional(18.0),
+					STAGE_TEXT,
+				);
+				painter.text(
+					area.center() + egui::vec2(0.0, 14.0),
+					egui::Align2::CENTER_CENTER,
+					"Everyone is still connected. Turn off Video only to see them.",
+					egui::FontId::proportional(13.0),
+					STAGE_MUTED,
+				);
+			}
 			return;
 		}
 		// Focus survives only while that tile still shows video; Escape restores the grid.
@@ -1303,33 +1441,44 @@ impl MessagingUi {
 				}
 			}
 		} else {
-			// Pick the column count that makes the tiles largest inside the stage, so two
-			// participants fill the width instead of sitting in a corner. Frameless DM avatars
-			// instead keep Discord's tight spacing and shrink to fit a short panel.
-			let (columns, size) = if frameless {
-				frameless_fit(tiles.len(), area.size())
+			// Frameless DM avatars keep Discord's tight spacing and shrink to fit a short panel.
+			// Everything else packs rows of tiles in their own video aspect, so each video is as
+			// large as the whole stage allows; only avatar-only stages keep a size cap.
+			let rects = if frameless {
+				let (columns, size) = frameless_fit(tiles.len(), area.size());
+				if size.x < 24.0 || size.y < 24.0 {
+					return;
+				}
+				let rows = tiles.len().div_ceil(columns);
+				let content = size.y * rows as f32 + TILE_GAP * (rows as f32 - 1.0);
+				let top = area.top() + ((area.height() - content) * 0.5).max(0.0);
+				(0..tiles.len())
+					.map(|index| {
+						let (row, column) = (index / columns, index % columns);
+						let in_row = (tiles.len() - row * columns).min(columns);
+						let width = size.x * in_row as f32 + TILE_GAP * (in_row as f32 - 1.0);
+						let x = area.center().x - width * 0.5 + (size.x + TILE_GAP) * column as f32;
+						egui::Rect::from_min_size(
+							egui::pos2(x, top + (size.y + TILE_GAP) * row as f32),
+							size,
+						)
+					})
+					.collect()
 			} else {
-				best_fit(tiles.len(), area.size(), 620.0)
+				let aspects: Vec<f32> = tiles
+					.iter()
+					.map(|tile| self.tile_aspect(state, channel, tile))
+					.collect();
+				let cap = (!video).then_some(AVATAR_TILE_CAP);
+				let rects = fit_grid(&aspects, area, TILE_GAP, cap);
+				if rects.iter().any(|r| r.width() < 24.0 || r.height() < 24.0) {
+					return;
+				}
+				rects
 			};
-			if size.x < 24.0 || size.y < 24.0 {
-				return;
-			}
-			let rows = tiles.len().div_ceil(columns);
-			let content = size.y * rows as f32 + TILE_GAP * (rows as f32 - 1.0);
-			let top = area.top() + ((area.height() - content) * 0.5).max(0.0);
-			for row in 0..rows {
-				let first = row * columns;
-				let in_row = (tiles.len() - first).min(columns);
-				let width = size.x * in_row as f32 + TILE_GAP * (in_row as f32 - 1.0);
-				let mut x = area.center().x - width * 0.5;
-				let y = top + (size.y + TILE_GAP) * row as f32;
-				for tile in &tiles[first..first + in_row] {
-					let rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
-					x += size.x + TILE_GAP;
-					if let Some(focus) = self.tile(ui, state, channel, tile, rect, frameless, false)
-					{
-						toggle = Some(focus);
-					}
+			for (tile, rect) in tiles.iter().zip(rects) {
+				if let Some(focus) = self.tile(ui, state, channel, tile, rect, frameless, false) {
+					toggle = Some(focus);
 				}
 			}
 		}
@@ -1342,7 +1491,7 @@ impl MessagingUi {
 		state.voice.active.as_ref().is_some_and(|call| {
 			call.channel == channel
 				&& call.phase != Phase::Failed
-				&& call.watching == Some(streamer)
+				&& call.watching.contains(&streamer)
 		})
 	}
 
@@ -1351,6 +1500,46 @@ impl MessagingUi {
 			.iter()
 			.find(|(id, _)| *id == user)
 			.map(|(_, texture)| texture)
+	}
+
+	/// Width over height of what a tile shows: the decoded picture's own shape, or 16:9 while
+	/// there is none. Only reads textures that already exist, so a layout change never touches
+	/// decoders or uploads.
+	fn tile_aspect(&self, state: &State, channel: Id, tile: &Tile<'_>) -> f32 {
+		let size = match tile {
+			Tile::LocalScreen => self
+				.screen
+				.preview
+				.as_ref()
+				.filter(|_| !self.screen.preview_paused)
+				.map(|texture| texture.resolution_vec2()),
+			Tile::Stream(streamer) => self
+				.voice_streams
+				.iter()
+				.find(|view| view.user == *streamer)
+				.and_then(|view| view.texture)
+				.map(|texture| texture.size),
+			Tile::Participant(entry) => {
+				let own = state
+					.user
+					.as_ref()
+					.is_some_and(|user| user.id == entry.participant.user);
+				if !self.tile_has_video(state, channel, tile) {
+					None
+				} else if own {
+					self.voice_camera_preview
+						.as_ref()
+						.map(|texture| texture.resolution_vec2())
+				} else {
+					self.remote_texture(entry.participant.user)
+						.map(|texture| texture.size)
+				}
+			}
+		};
+		size.filter(|size| size.x > 0.0 && size.y > 0.0)
+			.map_or(16.0 / 9.0, |size| {
+				(size.x / size.y).clamp(MIN_ASPECT, MAX_ASPECT)
+			})
 	}
 
 	fn tile_has_video(&self, state: &State, channel: Id, tile: &Tile<'_>) -> bool {
@@ -1415,7 +1604,7 @@ impl MessagingUi {
 						self.stream_audio_controls(ui);
 						ui.separator();
 						if ui.button("Stop watching").clicked() {
-							self.watch_request = Some(None);
+							self.watch_request = Some(WatchRequest::Stop(*streamer));
 							ui.close();
 						}
 					});
@@ -1436,7 +1625,7 @@ impl MessagingUi {
 						.as_ref()
 						.is_some_and(|call| call.channel == channel)
 					{
-						self.watch_request = Some(Some(*streamer));
+						self.watch_request = Some(WatchRequest::Watch(*streamer));
 					} else {
 						self.stream_preview_watch = Some((channel, *streamer));
 					}
@@ -1545,7 +1734,20 @@ impl MessagingUi {
 	) {
 		let name = participant_user(state, channel, streamer)
 			.map_or_else(|| "Participant".to_owned(), |user| user.name.clone());
-		let content = match &self.voice_stream_view {
+		let frame = ui.ctx().cumulative_frame_nr();
+		let (texture, status) = match self
+			.voice_streams
+			.iter_mut()
+			.find(|view| view.user == streamer)
+		{
+			Some(view) => {
+				// Tells the desktop this tile is on screen, so hidden streams skip GPU uploads.
+				view.painted = frame;
+				(view.texture, view.status)
+			}
+			None => (None, ""),
+		};
+		let content = match &texture {
 			Some(texture) => {
 				let content = fit_rect(rect, texture.size);
 				ui.put(
@@ -1557,10 +1759,10 @@ impl MessagingUi {
 			None => {
 				ui.painter().rect_filled(rect, 8, TILE_FILL);
 				if rect.height() >= 132.0 {
-					let status = if self.voice_stream_status.is_empty() {
+					let status = if status.is_empty() {
 						"Connecting to the stream…"
 					} else {
-						self.voice_stream_status
+						status
 					};
 					let spinner = egui::Rect::from_center_size(
 						rect.center() - egui::vec2(0.0, 18.0),
@@ -1590,12 +1792,95 @@ impl MessagingUi {
 		}
 		// Fullscreen has no call bar, so it keeps its own small audio and stop actions.
 		if overlay {
-			self.stream_overlay_controls(ui, content);
+			self.stream_overlay_controls(ui, state, content, streamer);
+		} else {
+			self.stream_tile_actions(ui, state, rect, streamer);
+		}
+	}
+
+	/// Hover actions on one watched share's grid tile: listen to it and stop watching it.
+	/// Each acts on this stream only; the other streams keep playing.
+	fn stream_tile_actions(
+		&mut self,
+		ui: &mut egui::Ui,
+		state: &State,
+		rect: egui::Rect,
+		streamer: Id,
+	) {
+		let opacity = self.badge_opacity();
+		if rect.height() < 96.0 || rect.width() < 160.0 || opacity < 0.05 {
+			return;
+		}
+		let size = 28.0;
+		let danger = design::palette(ui).danger;
+		let close = egui::Rect::from_min_size(
+			egui::pos2(rect.right() - 8.0 - size, rect.top() + 8.0),
+			egui::Vec2::splat(size),
+		);
+		let speaker = close.translate(egui::vec2(-(size + 6.0), 0.0));
+		let audible = self.voice_audible_stream(state) == Some(streamer);
+		let alpha = |value: f32| (value * opacity) as u8;
+		for (area, icon, tint, label, hint) in [
+			(
+				speaker,
+				crate::icons::Icon::Speaker,
+				if audible && self.voice_stream_volume() > 0 {
+					egui::Color32::WHITE
+				} else {
+					danger
+				},
+				"Listen to this stream",
+				if audible {
+					"Mute this stream"
+				} else {
+					"Listen to this stream and mute the others"
+				},
+			),
+			(
+				close,
+				crate::icons::Icon::Close,
+				egui::Color32::WHITE,
+				"Stop watching",
+				"Stop watching this screen share",
+			),
+		] {
+			let response = ui.interact(
+				area,
+				ui.scope_id().with(("voice-stream-action", streamer, label)),
+				egui::Sense::click(),
+			);
+			ui.painter().rect_filled(
+				area,
+				8,
+				egui::Color32::from_black_alpha(alpha(if response.hovered() {
+					220.0
+				} else {
+					170.0
+				})),
+			);
+			crate::icons::paint(ui.painter(), icon, area.shrink(7.0), tint);
+			response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+			let clicked = response.on_hover_text(hint).clicked();
+			if clicked && icon == crate::icons::Icon::Close {
+				self.watch_request = Some(WatchRequest::Stop(streamer));
+			} else if clicked {
+				self.voice_stream_listen = if audible {
+					StreamListen::Silent
+				} else {
+					StreamListen::Stream(streamer)
+				};
+			}
 		}
 	}
 
 	/// Bottom-right actions over a fullscreen share: stream audio and Stop watching.
-	fn stream_overlay_controls(&mut self, ui: &mut egui::Ui, content: egui::Rect) {
+	fn stream_overlay_controls(
+		&mut self,
+		ui: &mut egui::Ui,
+		state: &State,
+		content: egui::Rect,
+		streamer: Id,
+	) {
 		let height = 40.0;
 		let stop_label = "Stop watching";
 		let font = egui::FontId::new(13.0, design::medium_family(ui.ctx()));
@@ -1621,7 +1906,8 @@ impl MessagingUi {
 			ui.painter(),
 			crate::icons::Icon::Speaker,
 			audio.shrink(10.0),
-			if self.voice_stream_volume() == 0 {
+			if self.voice_stream_volume() == 0 || self.voice_audible_stream(state) != Some(streamer)
+			{
 				danger
 			} else {
 				egui::Color32::WHITE
@@ -1652,7 +1938,7 @@ impl MessagingUi {
 			.on_hover_text("Stop receiving this screen share")
 			.clicked()
 		{
-			self.watch_request = Some(None);
+			self.watch_request = Some(WatchRequest::Stop(streamer));
 		}
 	}
 
@@ -1771,13 +2057,34 @@ impl MessagingUi {
 	/// Apply a tile's watch click once the stage has mutable state again.
 	pub(super) fn apply_watch_request(&mut self, state: &mut State) {
 		match self.watch_request.take() {
-			// Like Discord, a share opens enlarged as soon as you choose to watch it.
-			Some(Some(user)) => {
+			// Like Discord, a share opens enlarged as soon as you choose to watch it. Streams
+			// that are already open stay open.
+			Some(WatchRequest::Watch(user)) => {
 				if state.watch_stream(user).is_some() {
 					self.voice_focus = Some(StageFocus::Stream(user));
+				} else if state
+					.voice
+					.active
+					.as_ref()
+					.is_some_and(|call| call.watching.len() >= client_core::voice::MAX_WATCHED)
+				{
+					state.status = "Stop watching one of the open streams first";
 				}
 			}
-			Some(None) => state.stop_watching(),
+			Some(WatchRequest::Stop(user)) => {
+				state.stop_watching(user);
+				if self.voice_focus == Some(StageFocus::Stream(user)) {
+					self.voice_focus = None;
+				}
+				if state
+					.voice
+					.active
+					.as_ref()
+					.is_none_or(|call| call.watching.is_empty())
+				{
+					self.voice_stream_listen = StreamListen::Auto;
+				}
+			}
 			None => {}
 		}
 	}
@@ -1812,7 +2119,7 @@ impl MessagingUi {
 			.as_ref()
 			.filter(|call| call.channel == entry.channel && call.phase != Phase::Failed);
 		let inactive = inactive_recipient(state, entry.channel, entry.participant.user);
-		// The local preview is mirrored like a webcam; remote cameras fill the tile edge to edge.
+		// The local preview is mirrored like a webcam; cameras keep their own aspect inside the tile.
 		let video = if own && call.is_some_and(|call| call.camera) {
 			self.voice_camera_preview
 				.as_ref()
@@ -1827,7 +2134,7 @@ impl MessagingUi {
 			ui.painter().rect_filled(rect, 8, TILE_FILL);
 		}
 		if let Some((id, image, mirror)) = video {
-			cover_image(ui, rect, id, image, mirror);
+			contain_image(ui, rect, id, image, mirror);
 		}
 		let speaking = self.is_speaking(state, entry.channel, &entry.participant);
 		let avatar_size = tile_avatar(size, frameless);
@@ -3419,7 +3726,7 @@ impl MessagingUi {
 		// Discord's call bar: microphone and camera with their device menus, then share and
 		// more, then the red action; view actions sit at the right edge.
 		let watched = match self.voice_focus {
-			Some(StageFocus::Stream(user)) if call.watching == Some(user) => Some(user),
+			Some(StageFocus::Stream(user)) if call.watching.contains(&user) => Some(user),
 			_ => None,
 		};
 		let bar = ui.max_rect();
@@ -3684,8 +3991,8 @@ impl MessagingUi {
 				.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
 				.show(|ui| self.stream_audio_controls(ui));
 		}
-		if stop_watching {
-			self.watch_request = Some(None);
+		if stop_watching && let Some(user) = watched {
+			self.watch_request = Some(WatchRequest::Stop(user));
 			self.voice_focus = None;
 		}
 		if camera_clicked && let Some(command) = state.set_call_camera(!camera) {
@@ -3883,6 +4190,16 @@ impl MessagingUi {
 						true,
 					);
 					self.voice_chrome_hidden = 0.0;
+					self.video_only_toggle(
+						ui,
+						rect,
+						top + TILE_GAP,
+						if self.voice_focus.is_some() {
+							1.0 - reveal
+						} else {
+							0.0
+						},
+					);
 					if self.voice_focus.is_some() {
 						chrome_shade(ui, rect, 72.0, true, reveal);
 						chrome_shade(ui, rect, 96.0, false, reveal);
@@ -4473,6 +4790,11 @@ const STAGE_TEXT: egui::Color32 = egui::Color32::from_rgb(0xdb, 0xde, 0xe1);
 const STAGE_MUTED: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x9b, 0xa1);
 const STAGE_MARGIN: f32 = 16.0;
 const TILE_GAP: f32 = 8.0;
+/// Widest an avatar-only tile grows; stages with video use the whole stage instead.
+const AVATAR_TILE_CAP: f32 = 620.0;
+/// Bounds on a tile's aspect ratio, so a degenerate frame cannot collapse the layout.
+const MIN_ASPECT: f32 = 0.4;
+const MAX_ASPECT: f32 = 3.5;
 /// Frameless DM tile height and the horizontal room beside each avatar for its name.
 const FRAMELESS_HEIGHT: f32 = 132.0;
 const FRAMELESS_MARGIN: f32 = 20.0;
@@ -4485,6 +4807,31 @@ const HANG_UP: f32 = 64.0;
 const BAR_GAP: f32 = 12.0;
 
 /// Green ring like Discord's speaking indicator; the accessible label still names the state.
+/// One watched screen share as the desktop reports it each frame.
+#[derive(Clone, Debug)]
+pub struct StreamView {
+	pub user: Id,
+	pub texture: Option<egui::load::SizedTexture>,
+	pub status: &'static str,
+	/// Frame number of the last paint of this stream's tile; hidden streams skip GPU uploads.
+	pub painted: u64,
+}
+/// Which watched stream plays through the one playback device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StreamListen {
+	/// The oldest watched stream.
+	#[default]
+	Auto,
+	Stream(Id),
+	Silent,
+}
+/// A click to start or stop watching one stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WatchRequest {
+	Watch(Id),
+	Stop(Id),
+}
+
 /// Which stage tile is enlarged; cleared automatically when it stops showing video.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StageFocus {
@@ -4546,26 +4893,103 @@ fn frameless_fit(count: usize, area: egui::Vec2) -> (usize, egui::Vec2) {
 	}
 }
 
-/// Column count and tile size that make the tiles largest inside `area`, at 16:9.
-fn best_fit(count: usize, area: egui::Vec2, cap: f32) -> (usize, egui::Vec2) {
-	let mut best = (1, egui::Vec2::ZERO);
-	for columns in 1..=count.max(1) {
-		let rows = count.div_ceil(columns);
-		let width = (area.x - TILE_GAP * (columns - 1) as f32) / columns as f32;
-		let height = (area.y - TILE_GAP * (rows - 1) as f32) / rows as f32;
-		if width <= 0.0 || height <= 0.0 {
-			continue;
+/// Packs tiles of the given aspect ratios (width over height) into `area` as centred rows,
+/// in order, choosing the arrangement with the largest total tile area. Every tile keeps its
+/// own aspect, so nothing needs cropping or letterboxing, and rows of different shapes still
+/// share one height per row. `cap` bounds a tile's width for stages without video.
+fn fit_grid(aspects: &[f32], area: egui::Rect, gap: f32, cap: Option<f32>) -> Vec<egui::Rect> {
+	let count = aspects.len();
+	if count == 0 || area.width() <= 0.0 || area.height() <= 0.0 {
+		return vec![egui::Rect::from_min_size(area.min, egui::Vec2::ZERO); count];
+	}
+	// Row sizes to try: filled left to right with `n` columns, or as even as possible.
+	let mut candidates: Vec<Vec<usize>> = Vec::new();
+	for columns in (1..=count).rev() {
+		let mut rows = vec![columns; count / columns];
+		if !count.is_multiple_of(columns) {
+			rows.push(count % columns);
 		}
-		let width = width.min(height * 16.0 / 9.0).min(cap);
-		// Prefer side-by-side tiles when the size cap makes multiple layouts tie.
-		if width >= best.1.x {
-			best = (columns, egui::vec2(width, width * 9.0 / 16.0));
+		candidates.push(rows);
+	}
+	for rows in 2..count {
+		let (base, extra) = (count / rows, count % rows);
+		candidates.push(
+			(0..rows)
+				.map(|row| base + usize::from(row < extra))
+				.collect(),
+		);
+	}
+	let place = |rows: &[usize]| -> (f32, Vec<f32>) {
+		// Natural row height when the row spans the full width.
+		let mut first = 0;
+		let natural: Vec<f32> = rows
+			.iter()
+			.map(|&in_row| {
+				let sum: f32 = aspects[first..first + in_row].iter().sum();
+				let height = (area.width() - gap * (in_row as f32 - 1.0)) / sum;
+				first += in_row;
+				height
+			})
+			.collect();
+		let gaps = gap * (rows.len() as f32 - 1.0);
+		let mut scale = ((area.height() - gaps) / natural.iter().sum::<f32>()).clamp(0.0, 1.0);
+		if let Some(cap) = cap {
+			let widest = natural
+				.iter()
+				.zip(rows)
+				.scan(0, |first, (height, &in_row)| {
+					let widest = aspects[*first..*first + in_row]
+						.iter()
+						.fold(0.0f32, |most, aspect| most.max(aspect * height));
+					*first += in_row;
+					Some(widest)
+				})
+				.fold(0.0f32, f32::max);
+			scale = scale.min(cap / widest);
+		}
+		let mut area_sum = 0.0;
+		let mut first = 0;
+		for (height, &in_row) in natural.iter().zip(rows) {
+			let height = height * scale;
+			area_sum += aspects[first..first + in_row]
+				.iter()
+				.map(|aspect| aspect * height * height)
+				.sum::<f32>();
+			first += in_row;
+		}
+		(area_sum, natural.into_iter().map(|h| h * scale).collect())
+	};
+	let mut best: Option<(f32, &Vec<usize>, Vec<f32>)> = None;
+	for rows in &candidates {
+		let (score, heights) = place(rows);
+		// Ties keep the earlier, side-by-side arrangement.
+		if best.as_ref().is_none_or(|(top, ..)| score > top * 1.0001) {
+			best = Some((score, rows, heights));
 		}
 	}
-	if best.1.x <= 0.0 {
-		best = (count.max(1), egui::Vec2::ZERO);
+	let (_, rows, heights) = best.expect("at least one arrangement");
+	let content = heights.iter().sum::<f32>() + gap * (rows.len() as f32 - 1.0);
+	let mut y = area.top() + ((area.height() - content) * 0.5).max(0.0);
+	let mut rects = Vec::with_capacity(count);
+	let mut first = 0;
+	for (&in_row, &height) in rows.iter().zip(&heights) {
+		let widths: Vec<f32> = aspects[first..first + in_row]
+			.iter()
+			.map(|aspect| aspect * height)
+			.collect();
+		let row = widths.iter().sum::<f32>() + gap * (in_row as f32 - 1.0);
+		let mut x = area.center().x - row * 0.5;
+		for width in widths {
+			rects.push(egui::Rect::from_min_size(
+				egui::pos2(x, y),
+				egui::vec2(width, height),
+			));
+			x += width + gap;
+		}
+		y += height + gap;
+		first += in_row;
 	}
-	best
+	rects
 }
 
 /// The largest centred rectangle of the image's aspect ratio inside `rect`.
@@ -4577,8 +5001,8 @@ fn fit_rect(rect: egui::Rect, image: egui::Vec2) -> egui::Rect {
 	egui::Rect::from_center_size(rect.center(), size)
 }
 
-/// Fill the tile edge to edge, cropping the overflow (Discord's camera framing).
-fn cover_image(
+/// Draw the whole image at its own aspect inside the tile, never cropping or stretching it.
+fn contain_image(
 	ui: &mut egui::Ui,
 	rect: egui::Rect,
 	id: egui::TextureId,
@@ -4588,18 +5012,14 @@ fn cover_image(
 	if image.x <= 0.0 || image.y <= 0.0 {
 		return;
 	}
-	let scale = (rect.width() / image.x).max(rect.height() / image.y);
-	let shown = egui::vec2(
-		(rect.width() / (image.x * scale)).min(1.0),
-		(rect.height() / (image.y * scale)).min(1.0),
-	);
-	let mut uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), shown);
+	let content = fit_rect(rect, image);
+	let mut uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
 	if mirror {
 		std::mem::swap(&mut uv.min.x, &mut uv.max.x);
 	}
 	ui.put(
-		rect,
-		egui::Image::from_texture((id, rect.size()))
+		content,
+		egui::Image::from_texture((id, content.size()))
 			.uv(uv)
 			.corner_radius(8),
 	);
@@ -6502,6 +6922,161 @@ mod tests {
 		);
 	}
 
+	fn multistream_state() -> State {
+		let mut state = test_support::voice_demo_state();
+		let call = state.voice.active.as_mut().unwrap();
+		for user in [2, 3] {
+			call.participants
+				.iter_mut()
+				.find(|participant| participant.user == Id(user))
+				.unwrap()
+				.streaming = true;
+		}
+		let template = call.participants[0];
+		for user in 10..14 {
+			call.participants.push(Participant {
+				user: Id(user),
+				streaming: true,
+				..template
+			});
+		}
+		state
+	}
+
+	#[test]
+	fn watched_streams_each_keep_a_tile_in_the_order_they_opened() {
+		let mut state = multistream_state();
+		let ui = MessagingUi::default();
+		assert!(state.watch_stream(Id(3)).is_some());
+		assert!(state.watch_stream(Id(2)).is_some());
+		let entries = stage_participants(&state, Id(25));
+		let streams = ui
+			.stage_tiles(&state, Id(25), &entries)
+			.iter()
+			.filter_map(|tile| match tile {
+				Tile::Stream(user) => Some(*user),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		// Watched streams lead in opening order; unwatched shares follow as invitations.
+		assert_eq!(&streams[..2], [Id(3), Id(2)]);
+		assert!(streams[2..].iter().all(|user| user.0 >= 10));
+		assert!(ui.watching(&state, Id(25), Id(3)) && ui.watching(&state, Id(25), Id(2)));
+		assert!(!ui.watching(&state, Id(25), Id(10)));
+	}
+
+	#[test]
+	fn video_only_hides_voice_only_tiles_without_touching_the_call() {
+		let mut state = multistream_state();
+		let mut ui = MessagingUi::default();
+		assert!(state.watch_stream(Id(3)).is_some());
+		let participants = |state: &State, ui: &MessagingUi| {
+			let entries = stage_participants(state, Id(25));
+			ui.stage_tiles(state, Id(25), &entries)
+				.iter()
+				.filter_map(|tile| match tile {
+					Tile::Participant(entry) => Some(entry.participant.user),
+					_ => None,
+				})
+				.collect::<Vec<_>>()
+		};
+		let everyone = participants(&state, &ui);
+		ui.voice_video_only = true;
+		let own = state.user.as_ref().map(|user| user.id);
+		let call = state.voice.active.as_mut().unwrap();
+		call.camera = false;
+		let camera_users: Vec<Id> = call
+			.participants
+			.iter()
+			.filter(|participant| participant.video && Some(participant.user) != own)
+			.map(|participant| participant.user)
+			.collect();
+		assert_eq!(participants(&state, &ui), camera_users);
+		assert!(
+			camera_users.len() < everyone.len(),
+			"fixture has voice-only users"
+		);
+		// Your own camera counts as video; a watched or live share keeps its box, so one can
+		// still be chosen, and the filter never closes or starts a stream.
+		state.voice.active.as_mut().unwrap().camera = true;
+		assert_eq!(
+			participants(&state, &ui).contains(&own.unwrap()),
+			own.is_some()
+		);
+		let streams = |ui: &MessagingUi| {
+			ui.stage_tiles(&state, Id(25), &stage_participants(&state, Id(25)))
+				.iter()
+				.filter(|tile| matches!(tile, Tile::Stream(_)))
+				.count()
+		};
+		let filtered = streams(&ui);
+		ui.voice_video_only = false;
+		assert!(filtered >= 1 && filtered == streams(&ui));
+		ui.voice_video_only = true;
+		assert_eq!(state.voice.active.as_ref().unwrap().watching, [Id(3)]);
+		// Outside the joined call the roster is never hidden.
+		assert!(!ui.video_only_active(&state, Id(99)));
+		ui.voice_video_only = false;
+		assert_eq!(participants(&state, &ui), everyone);
+	}
+
+	#[test]
+	fn stopping_one_stream_keeps_the_others_and_the_set_stays_bounded() {
+		let mut state = multistream_state();
+		let mut ui = MessagingUi::default();
+		for user in [2, 3, 10, 11] {
+			ui.watch_request = Some(WatchRequest::Watch(Id(user)));
+			ui.apply_watch_request(&mut state);
+		}
+		assert_eq!(ui.voice_focus, Some(StageFocus::Stream(Id(11))));
+		let watching = |state: &State| state.voice.active.as_ref().unwrap().watching.clone();
+		assert_eq!(watching(&state), [Id(2), Id(3), Id(10), Id(11)]);
+		// A fifth stream is refused with a reason, and nothing already open closes.
+		ui.watch_request = Some(WatchRequest::Watch(Id(12)));
+		ui.apply_watch_request(&mut state);
+		assert_eq!(watching(&state).len(), client_core::voice::MAX_WATCHED);
+		assert_eq!(state.status, "Stop watching one of the open streams first");
+		// Closing the enlarged stream restores the grid and leaves the rest open.
+		ui.watch_request = Some(WatchRequest::Stop(Id(11)));
+		ui.apply_watch_request(&mut state);
+		assert_eq!(ui.voice_focus, None);
+		assert_eq!(watching(&state), [Id(2), Id(3), Id(10)]);
+		ui.watch_request = Some(WatchRequest::Watch(Id(12)));
+		ui.apply_watch_request(&mut state);
+		assert_eq!(watching(&state), [Id(2), Id(3), Id(10), Id(12)]);
+	}
+
+	#[test]
+	fn exactly_one_watched_stream_is_audible_and_falls_back_when_it_closes() {
+		let mut state = multistream_state();
+		let mut ui = MessagingUi::default();
+		assert_eq!(ui.voice_audible_stream(&state), None);
+		for user in [3, 2, 10] {
+			state.watch_stream(Id(user)).unwrap();
+		}
+		assert_eq!(
+			ui.voice_audible_stream(&state),
+			Some(Id(3)),
+			"oldest by default"
+		);
+		ui.voice_stream_listen = StreamListen::Stream(Id(10));
+		assert_eq!(ui.voice_audible_stream(&state), Some(Id(10)));
+		ui.voice_stream_listen = StreamListen::Silent;
+		assert_eq!(ui.voice_audible_stream(&state), None);
+		// Closing the chosen stream hands playback back to the oldest remaining one.
+		ui.voice_stream_listen = StreamListen::Stream(Id(10));
+		ui.watch_request = Some(WatchRequest::Stop(Id(10)));
+		ui.apply_watch_request(&mut state);
+		assert_eq!(ui.voice_audible_stream(&state), Some(Id(3)));
+		// With nothing left, a later stream does not inherit an old mute.
+		ui.voice_stream_listen = StreamListen::Silent;
+		for user in [3, 2] {
+			ui.watch_request = Some(WatchRequest::Stop(Id(user)));
+			ui.apply_watch_request(&mut state);
+		}
+		assert_eq!(ui.voice_stream_listen, StreamListen::Auto);
+	}
+
 	#[test]
 	fn stream_preview_cards_stay_open_with_two_streamers_in_one_channel() {
 		let participant = |user| RosterEntry {
@@ -6639,7 +7214,7 @@ mod tests {
 				assert!(messaging.stream_preview_watch.is_none());
 				assert_eq!(
 					state.voice.active.as_ref().unwrap().watching,
-					present.then_some(Id(3))
+					present.then_some(Id(3)).into_iter().collect::<Vec<_>>()
 				);
 				assert_eq!(
 					state.selected,
@@ -6771,5 +7346,65 @@ mod tests {
 		output.drop_without_applying_deltas();
 		assert_eq!(badge_width, expected_width);
 		crate::i18n::set_current(prev_lang);
+	}
+	fn grid(aspects: &[f32], w: f32, h: f32) -> Vec<egui::Rect> {
+		fit_grid(
+			aspects,
+			egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h)),
+			TILE_GAP,
+			None,
+		)
+	}
+
+	/// Regression: tiles were capped at 620 px wide and forced to 16:9, so a lone share or the
+	/// two left after hiding others stayed small.
+	#[test]
+	fn video_grid_grows_when_tiles_leave_and_keeps_aspects() {
+		let wide = 16.0 / 9.0;
+		let four = grid(&[wide; 4], 1200.0, 900.0);
+		let two = grid(&[wide; 2], 1200.0, 900.0);
+		let one = grid(&[wide], 1600.0, 900.0);
+		assert!(
+			two[0].width() > four[0].width() * 1.4,
+			"{two:?} vs {four:?}"
+		);
+		assert!(
+			one[0].width() > 1590.0 && one[0].height() > 890.0,
+			"{one:?}"
+		);
+		for (aspects, w, h) in [
+			(vec![wide, 4.0 / 3.0, 9.0 / 16.0], 1280.0, 720.0),
+			(vec![9.0 / 16.0; 3], 1000.0, 1000.0),
+			(vec![wide; 7], 700.0, 1200.0),
+		] {
+			let rects = grid(&aspects, w, h);
+			for (rect, aspect) in rects.iter().zip(&aspects) {
+				assert!((rect.width() / rect.height() - aspect).abs() < 0.01);
+				assert!(rect.min.x >= -0.01 && rect.max.x <= w + 0.01);
+				assert!(rect.min.y >= -0.01 && rect.max.y <= h + 0.01);
+			}
+			for (i, a) in rects.iter().enumerate() {
+				for b in &rects[i + 1..] {
+					assert!(!a.shrink(0.1).intersects(*b), "{a:?} overlaps {b:?}");
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn video_grid_picks_the_stacking_that_fits_the_window() {
+		let wide = 16.0 / 9.0;
+		// Two 16:9 videos: side by side in a wide window, stacked in a tall one.
+		let side = grid(&[wide; 2], 1600.0, 600.0);
+		assert!(side[0].max.x < side[1].min.x);
+		let stacked = grid(&[wide; 2], 600.0, 1400.0);
+		assert!(stacked[0].max.y < stacked[1].min.y);
+	}
+
+	#[test]
+	fn avatar_only_tiles_keep_their_width_cap() {
+		let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+		let rects = fit_grid(&[16.0 / 9.0], area, TILE_GAP, Some(AVATAR_TILE_CAP));
+		assert!((rects[0].width() - AVATAR_TILE_CAP).abs() < 0.5);
 	}
 }

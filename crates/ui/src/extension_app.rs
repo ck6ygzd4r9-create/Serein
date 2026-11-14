@@ -764,7 +764,11 @@ impl MessagingUi {
 				if matches!(
 					action,
 					AppAction::SetStreamAudio { .. } | AppAction::StopWatching
-				) && state.voice.active.as_ref().and_then(|call| call.watching)
+				) && state
+					.voice
+					.active
+					.as_ref()
+					.and_then(|call| call.watching.first().copied())
 					!= confirmed.context.watched_stream
 				{
 					return Err("The watched stream changed; run the extension again.".into());
@@ -1537,7 +1541,7 @@ mod tests {
 		let ctx = egui::Context::default();
 		let mut state = test_support::call_demo_state();
 		let mut view = view(Capability::AudioSettings);
-		state.voice.active.as_mut().unwrap().watching = Some(Id(301));
+		state.voice.active.as_mut().unwrap().watching = vec![Id(301)];
 		let effect = proposal(
 			&state,
 			HostEffect::AppAction {
@@ -1547,7 +1551,7 @@ mod tests {
 				},
 			},
 		);
-		state.voice.active.as_mut().unwrap().watching = Some(Id(302));
+		state.voice.active.as_mut().unwrap().watching = vec![Id(302)];
 		assert!(
 			view.apply_extension_effect(&ctx, &mut state, effect, &mut Vec::new())
 				.is_err()

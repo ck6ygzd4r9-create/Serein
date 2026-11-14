@@ -143,7 +143,9 @@ use client_core::{Command, MAX_DRAFT_BYTES, NavStep, State};
 use egui::{RichText, TextEdit};
 use model::{Freshness, Id};
 pub use verification::VerificationUi;
-pub use voice::{StageFocus, VOICE_DEVICES_LOADED, VOICE_DEVICES_LOOKING};
+pub use voice::{
+	StageFocus, StreamListen, StreamView, VOICE_DEVICES_LOADED, VOICE_DEVICES_LOOKING,
+};
 mod voice_latency;
 pub use voice_latency::VoiceLatency;
 
@@ -487,9 +489,11 @@ pub struct MessagingUi {
 	pub camera_test_texture: Option<egui::TextureHandle>,
 	/// Decoded remote cameras by user; the desktop owns, bounds and replaces the textures.
 	pub voice_remote_video: Vec<(Id, egui::load::SizedTexture)>,
-	/// Latest picture of the screen share this device chose to watch; desktop-owned texture.
-	pub voice_stream_view: Option<egui::load::SizedTexture>,
-	pub voice_stream_status: &'static str,
+	/// One entry per screen share this device watches, in the order they were opened. The desktop
+	/// owns, bounds and replaces the textures; the stage only paints them.
+	pub voice_streams: Vec<voice::StreamView>,
+	/// Which watched stream feeds the single playback device.
+	pub voice_stream_listen: voice::StreamListen,
 	/// Session-only stream playback level; unset is 100%. Mute preserves the level.
 	voice_stream_volume: Option<u16>,
 	voice_stream_muted: bool,
@@ -501,12 +505,14 @@ pub struct MessagingUi {
 	voice_fullscreen_request: Option<bool>,
 	/// Whether the other participants stay visible as a strip under the enlarged tile.
 	pub voice_focus_participants: bool,
+	/// Call stage hides voice-only participants; a display filter, the call is unchanged.
+	pub voice_video_only: bool,
 	/// How far the call stage's hover chrome (and tile name badges) has faded out: 0 shown.
 	voice_chrome_hidden: f32,
 	/// Session-only visibility of the selected guild voice channel's chat.
 	pub voice_chat_open: bool,
-	/// Tile click to start (`Some(user)`) or stop (`None`) watching, applied by the stage.
-	watch_request: Option<Option<Id>>,
+	/// Tile click to start or stop watching one stream, applied by the stage.
+	watch_request: Option<voice::WatchRequest>,
 	ring_request: Option<(Id, u64, Id, bool)>,
 	voice_moderation: Option<(Id, Id, Id, model::server_admin::VoiceChange)>,
 	stream_preview_open: Option<((Id, Id, Id), u64)>,

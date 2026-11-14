@@ -512,7 +512,7 @@ existing call's mute controls still apply.
 | Nested `type` / Rust variant | Fields | Apply behavior |
 | --- | --- | --- |
 | `set_participant_audio` / `SetParticipantAudio` | `user_id`: ID; `volume_percent: Option<u16>`; `muted: Option<bool>` | Change local playback of a remote participant still in the current call. Volume is 0-200; mute preserves its configured gain for later unmute. Cannot target yourself. |
-| `set_stream_audio` / `SetStreamAudio` | `volume_percent: Option<u16>`; `muted: Option<bool>` | Change local playback of the currently watched stream. Volume is 0-200. Unavailable without a watched stream. |
+| `set_stream_audio` / `SetStreamAudio` | `volume_percent: Option<u16>`; `muted: Option<bool>` | Change local playback of the listened-to watched stream (the oldest one unless the user picked another). Volume is 0-200. Unavailable without a watched stream. |
 | `select_audio_devices` / `SelectAudioDevices` | `input_id`, `output_id`: string or null | Select at least one currently enumerated microphone/speaker by its exact host ID. Missing/null preserves that side. **Preview.** |
 | `refresh_media_devices` / `RefreshMediaDevices` | None | Ask the host to refresh its microphone, speaker and camera lists. It does not return those private lists to Wasm. **Preview.** |
 
@@ -537,8 +537,8 @@ returned by this action.
 | --- | --- | --- |
 | `join_voice` / `JoinVoice` | `channel_id`: ID; `ring`, `muted`, `deafened`: `bool` | `voice_connect`; request joining/calling a native eligible channel with explicit ring and audio choices. Joining with an unmuted microphone can transmit audio. |
 | `decline_call` / `DeclineCall` | `channel_id`: ID | `voice_connect`; decline the currently incoming call only if it still targets this channel. |
-| `watch_stream` / `WatchStream` | `user_id`: ID | `voice_control`; watch an available remote participant stream in the current call. |
-| `stop_watching` / `StopWatching` | None | `voice_control`; stop watching the current stream. Unavailable when none is watched. |
+| `watch_stream` / `WatchStream` | `user_id`: ID | `voice_control`; watch an available remote participant stream in the current call, in addition to any already watched (at most four). |
+| `stop_watching` / `StopWatching` | None | `voice_control`; stop watching every watched stream. Unavailable when none is watched. |
 | `set_camera` / `SetCamera` | `enabled`: `bool` | `camera_control`; enable/disable camera transmission in the current call. Enabling requires available camera capture and shares video with participants. Already matching state does nothing. |
 | `select_camera_device` / `SelectCameraDevice` | `device_id`: string or null | `camera_control`; select a currently enumerated camera, or null to clear the selection. Device IDs are at most 256 bytes and remain host-local. **Preview.** |
 | `open_screen_share_picker` / `OpenScreenSharePicker` | None | `media_control`; open the native screen/window picker for the current call. The plugin receives no source list or frames. **Preview.** |
@@ -552,7 +552,7 @@ Apply rechecks native call availability and the captured call identity. Switchin
 away from an existing call still requires the native switch confirmation; the
 plugin cannot bypass it. Participant playback, stream watching and camera
 proposals are rejected if the original call has ended or been replaced. Stop-watching
-proposals also require the originally watched stream. Normal
+proposals also require the originally captured (oldest) watched stream. Normal
 permission/device checks may reject otherwise well-formed proposals. These
 operations do not expose raw media to Wasm. Preview media actions only open or
 control native host UI; they do not disclose device names, identifiers, source
