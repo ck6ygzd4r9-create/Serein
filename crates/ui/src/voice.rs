@@ -1159,6 +1159,15 @@ impl MessagingUi {
 			self.voice_chrome_hidden = 0.0;
 		}
 
+		if connected {
+			// Over an enlarged video the switch follows the hover chrome like the call bar.
+			let hidden = if self.voice_focus.is_some() {
+				1.0 - reveal
+			} else {
+				0.0
+			};
+			self.video_only_toggle(ui, rect, rect.top() + STAGE_MARGIN, hidden);
+		}
 		self.apply_watch_request(state);
 		let bar = egui::Rect::from_min_max(
 			egui::pos2(rect.left(), rect.bottom() - bottom),
@@ -1219,7 +1228,105 @@ impl MessagingUi {
 				.map(Tile::Stream),
 		);
 		tiles.extend(entries.iter().map(Tile::Participant));
+		// A display filter only: everyone stays connected, audible and in `entries`; watched
+		// streams, decoders and focus are untouched. Live shares nobody watches keep their
+		// invite box so one can still be chosen.
+		if self.video_only_active(state, channel) {
+			let own = state.user.as_ref().map(|user| user.id);
+			let camera = call.is_some_and(|call| call.camera);
+			tiles.retain(|tile| match tile {
+				Tile::Participant(entry) => {
+					if Some(entry.participant.user) == own {
+						camera
+					} else {
+						entry.participant.video
+					}
+				}
+				Tile::LocalScreen | Tile::Stream(_) => true,
+			});
+		}
 		tiles
+	}
+
+	/// Whether the "show only video" filter applies to this channel's stage: only inside the
+	/// joined call, so browsing a channel's roster never hides who is there.
+	fn video_only_active(&self, state: &State, channel: Id) -> bool {
+		self.voice_video_only
+			&& state
+				.voice
+				.active
+				.as_ref()
+				.is_some_and(|call| call.channel == channel && call.phase != Phase::Failed)
+	}
+
+	/// The stage's top-right switch for the video-only filter; one click, no popup.
+	fn video_only_toggle(&mut self, ui: &mut egui::Ui, stage: egui::Rect, top: f32, hidden: f32) {
+		let colors = design::palette(ui);
+		let on = self.voice_video_only;
+		let size = egui::vec2(if on { 148.0 } else { 132.0 }, 32.0);
+		if stage.width() < size.x + 2.0 * STAGE_MARGIN {
+			return;
+		}
+		let rect =
+			egui::Rect::from_min_size(egui::pos2(stage.right() - STAGE_MARGIN - size.x, top), size);
+		let visible = 1.0 - hidden;
+		if visible <= 0.0 {
+			return;
+		}
+		let response = ui.interact(
+			rect,
+			ui.scope_id().with("voice-video-only"),
+			if visible > 0.5 {
+				egui::Sense::click()
+			} else {
+				egui::Sense::hover()
+			},
+		);
+		let fill = match (on, response.hovered() || response.has_focus()) {
+			(true, true) => colors.accent.gamma_multiply(1.15),
+			(true, false) => colors.accent,
+			(false, true) => egui::Color32::from_white_alpha(40),
+			(false, false) => egui::Color32::from_white_alpha(22),
+		};
+		let painter = ui.painter();
+		painter.rect_filled(rect, 16, fill.gamma_multiply(visible));
+		let ink = if on { egui::Color32::WHITE } else { STAGE_TEXT }.gamma_multiply(visible);
+		crate::icons::paint(
+			painter,
+			if on {
+				crate::icons::Icon::Video
+			} else {
+				crate::icons::Icon::VideoSlash
+			},
+			egui::Rect::from_center_size(
+				egui::pos2(rect.left() + 18.0, rect.center().y),
+				egui::Vec2::splat(16.0),
+			),
+			ink,
+		);
+		painter.text(
+			egui::pos2(rect.left() + 34.0, rect.center().y),
+			egui::Align2::LEFT_CENTER,
+			if on { "Video only: on" } else { "Video only" },
+			egui::FontId::proportional(13.0),
+			ink,
+		);
+		let label = if on {
+			"Show everyone in the call"
+		} else {
+			"Show only video"
+		};
+		response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, on, label));
+		if response
+			.on_hover_text(if on {
+				"Show participants without video again"
+			} else {
+				"Hide participants who are not sharing a camera or screen. Audio is unchanged"
+			})
+			.clicked()
+		{
+			self.voice_video_only = !on;
+		}
 	}
 
 	/// True once any stage tile carries video or a live share, so the direct-message stage
@@ -1247,6 +1354,24 @@ impl MessagingUi {
 	) {
 		let tiles = self.stage_tiles(state, channel, entries);
 		if tiles.is_empty() {
+			if self.video_only_active(state, channel) {
+				let area = ui.available_rect_before_wrap();
+				let painter = ui.painter();
+				painter.text(
+					area.center() - egui::vec2(0.0, 12.0),
+					egui::Align2::CENTER_CENTER,
+					"No one is sharing video",
+					egui::FontId::proportional(18.0),
+					STAGE_TEXT,
+				);
+				painter.text(
+					area.center() + egui::vec2(0.0, 14.0),
+					egui::Align2::CENTER_CENTER,
+					"Everyone is still connected. Turn off Video only to see them.",
+					egui::FontId::proportional(13.0),
+					STAGE_MUTED,
+				);
+			}
 			return;
 		}
 		// Focus survives only while that tile still shows video; Escape restores the grid.
@@ -4014,6 +4139,16 @@ impl MessagingUi {
 						true,
 					);
 					self.voice_chrome_hidden = 0.0;
+					self.video_only_toggle(
+						ui,
+						rect,
+						top + TILE_GAP,
+						if self.voice_focus.is_some() {
+							1.0 - reveal
+						} else {
+							0.0
+						},
+					);
 					if self.voice_focus.is_some() {
 						chrome_shade(ui, rect, 72.0, true, reveal);
 						chrome_shade(ui, rect, 96.0, false, reveal);
@@ -6699,6 +6834,61 @@ mod tests {
 		assert!(streams[2..].iter().all(|user| user.0 >= 10));
 		assert!(ui.watching(&state, Id(25), Id(3)) && ui.watching(&state, Id(25), Id(2)));
 		assert!(!ui.watching(&state, Id(25), Id(10)));
+	}
+
+	#[test]
+	fn video_only_hides_voice_only_tiles_without_touching_the_call() {
+		let mut state = multistream_state();
+		let mut ui = MessagingUi::default();
+		assert!(state.watch_stream(Id(3)).is_some());
+		let participants = |state: &State, ui: &MessagingUi| {
+			let entries = stage_participants(state, Id(25));
+			ui.stage_tiles(state, Id(25), &entries)
+				.iter()
+				.filter_map(|tile| match tile {
+					Tile::Participant(entry) => Some(entry.participant.user),
+					_ => None,
+				})
+				.collect::<Vec<_>>()
+		};
+		let everyone = participants(&state, &ui);
+		ui.voice_video_only = true;
+		let own = state.user.as_ref().map(|user| user.id);
+		let call = state.voice.active.as_mut().unwrap();
+		call.camera = false;
+		let camera_users: Vec<Id> = call
+			.participants
+			.iter()
+			.filter(|participant| participant.video && Some(participant.user) != own)
+			.map(|participant| participant.user)
+			.collect();
+		assert_eq!(participants(&state, &ui), camera_users);
+		assert!(
+			camera_users.len() < everyone.len(),
+			"fixture has voice-only users"
+		);
+		// Your own camera counts as video; a watched or live share keeps its box, so one can
+		// still be chosen, and the filter never closes or starts a stream.
+		state.voice.active.as_mut().unwrap().camera = true;
+		assert_eq!(
+			participants(&state, &ui).contains(&own.unwrap()),
+			own.is_some()
+		);
+		let streams = |ui: &MessagingUi| {
+			ui.stage_tiles(&state, Id(25), &stage_participants(&state, Id(25)))
+				.iter()
+				.filter(|tile| matches!(tile, Tile::Stream(_)))
+				.count()
+		};
+		let filtered = streams(&ui);
+		ui.voice_video_only = false;
+		assert!(filtered >= 1 && filtered == streams(&ui));
+		ui.voice_video_only = true;
+		assert_eq!(state.voice.active.as_ref().unwrap().watching, [Id(3)]);
+		// Outside the joined call the roster is never hidden.
+		assert!(!ui.video_only_active(&state, Id(99)));
+		ui.voice_video_only = false;
+		assert_eq!(participants(&state, &ui), everyone);
 	}
 
 	#[test]

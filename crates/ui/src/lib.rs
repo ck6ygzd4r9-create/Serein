@@ -505,6 +505,8 @@ pub struct MessagingUi {
 	voice_fullscreen_request: Option<bool>,
 	/// Whether the other participants stay visible as a strip under the enlarged tile.
 	pub voice_focus_participants: bool,
+	/// Call stage hides voice-only participants; a display filter, the call is unchanged.
+	pub voice_video_only: bool,
 	/// How far the call stage's hover chrome (and tile name badges) has faded out: 0 shown.
 	voice_chrome_hidden: f32,
 	/// Session-only visibility of the selected guild voice channel's chat.
